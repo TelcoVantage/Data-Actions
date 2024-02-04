@@ -1,0 +1,60 @@
+{
+  "name": "Prod - Last known Queue - Exported 2024-02-04 @ 14:53",
+  "integrationType": "purecloud-data-actions",
+  "actionType": "custom",
+  "config": {
+    "request": {
+      "requestUrlTemplate": "/api/v2/analytics/conversations/details/query",
+      "requestType": "POST",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "requestTemplate": "{\n \"interval\": \"2024-01-01/2024-01-29\",\n \"order\": \"desc\",\n \"orderBy\": \"conversationStart\",\n \"paging\": {\n  \"pageSize\": 1,\n  \"pageNumber\": 1\n },\n \"segmentFilters\": [\n  {\n   \"type\": \"and\",\n   \"predicates\": [\n    {\n     \"type\": \"dimension\",\n     \"dimension\": \"ani\",\n     \"operator\": \"matches\",\n     \"value\": \"tel:${input.ANI}\"\n    },\n    {\n         \"type\": \"dimension\",\n          \"dimension\": \"queueId\",\n          \"operator\": \"exists\"\n    }\n   ]\n  }\n ]\n}"
+    },
+    "response": {
+      "translationMap": {
+        "QueueID": "$.conversations..participants..sessions..segments..queueId"
+      },
+      "translationMapDefaults": {
+        "QueueID": "[]"
+      },
+      "successTemplate": "{\n\"QueueID\": ${successTemplateUtils.firstFromArray(\"${QueueID}\")}}"
+    }
+  },
+  "contract": {
+    "input": {
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "title": "Search for Previous Conversations By ANI",
+        "description": "Get previous conversations for the given ANI.",
+        "type": "object",
+        "properties": {
+          "INTERVAL": {
+            "description": "The time interval to search",
+            "type": "string",
+            "minLength": 1
+          },
+          "ANI": {
+            "description": "The ANI of the caller",
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "output": {
+      "successSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "type": "object",
+        "properties": {
+          "QueueID": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "secure": false
+}

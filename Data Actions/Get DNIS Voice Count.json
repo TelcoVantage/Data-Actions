@@ -1,0 +1,50 @@
+{
+  "name": "Get DNIS Count - Outbound dialler - Exported 2024-02-04 @ 14:52",
+  "integrationType": "purecloud-data-actions",
+  "actionType": "custom",
+  "config": {
+    "request": {
+      "requestUrlTemplate": "/api/v2/analytics/conversations/details/query",
+      "requestType": "POST",
+      "headers": {},
+      "requestTemplate": "{\n \"interval\": \"${input.Interval}\",\n \"order\": \"asc\",\n \"orderBy\": \"conversationStart\",\n \"paging\": {\n  \"pageSize\": 100,\n  \"pageNumber\": 1\n },\n \"segmentFilters\": [\n  {\n   \"type\": \"or\",\n   \"predicates\": [\n    {\n     \"type\": \"dimension\",\n     \"dimension\": \"dnis\",\n     \"operator\": \"matches\",\n     \"value\": \"${input.ANI}\"\n    }\n   ]\n  }\n ]\n}"
+    },
+    "response": {
+      "translationMap": {
+        "count": "$.conversations.size()"
+      },
+      "translationMapDefaults": {
+        "count": "0"
+      },
+      "successTemplate": "{ \"Count\": ${count} }"
+    }
+  },
+  "contract": {
+    "input": {
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "Interval": {
+            "type": "string"
+          },
+          "ANI": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "output": {
+      "successSchema": {
+        "type": "object",
+        "properties": {
+          "Count": {
+            "type": "integer"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "secure": false
+}

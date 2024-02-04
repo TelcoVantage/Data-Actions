@@ -1,0 +1,49 @@
+{
+  "name": "Send SMS (v4) - Exported 2024-02-04 @ 14:53",
+  "integrationType": "purecloud-data-actions",
+  "actionType": "custom",
+  "config": {
+    "request": {
+      "requestUrlTemplate": "/api/v2/conversations/messages/agentless",
+      "requestType": "POST",
+      "headers": {},
+      "requestTemplate": "{\n  \"fromAddress\": \"${input.from}\",\n  \"toAddress\": \"${input.to}\",\n  \"toAddressMessengerType\": \"sms\",\n  \"textBody\": \"${input.body}\",\n  \"useExistingActiveConversation\": true\n}"
+    },
+    "response": {
+      "translationMap": {},
+      "translationMapDefaults": {},
+      "successTemplate": "${rawResult}"
+    }
+  },
+  "contract": {
+    "input": {
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "output": {
+      "successSchema": {
+        "type": "object",
+        "properties": {
+          "conversationId": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "secure": false
+}

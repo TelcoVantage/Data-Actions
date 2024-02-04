@@ -1,0 +1,78 @@
+{
+  "name": "Get Member of Queue that are IDLE - Exported 2024-02-04 @ 14:53",
+  "integrationType": "purecloud-data-actions",
+  "actionType": "custom",
+  "config": {
+    "request": {
+      "requestUrlTemplate": "/api/v2/routing/queues/${input.QUEUE_ID}/members?routingStatus=${input.name}&joined=true",
+      "requestType": "GET",
+      "headers": {
+        "Content-Type": "application/json",
+        "UserAgent": "PureCloudIntegrations/1.0"
+      },
+      "requestTemplate": "${input.rawRequest}"
+    },
+    "response": {
+      "translationMap": {},
+      "translationMapDefaults": {},
+      "successTemplate": "${rawResult}"
+    }
+  },
+  "contract": {
+    "input": {
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "title": "Check QueueID routingStatus",
+        "description": "Check QueueID with Skill for provided routingStatus",
+        "type": "object",
+        "required": [
+          "QUEUE_ID"
+        ],
+        "properties": {
+          "QUEUE_ID": {
+            "description": "QueueID",
+            "type": "string"
+          },
+          "name": {
+            "description": "Skill",
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "output": {
+      "successSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "description": "Response",
+        "type": "object",
+        "properties": {
+          "entities": {
+            "type": "array",
+            "items": {
+              "title": "entities",
+              "type": "object",
+              "properties": {
+                "user": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "email": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "secure": false
+}

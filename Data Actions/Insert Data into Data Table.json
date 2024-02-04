@@ -1,0 +1,68 @@
+{
+  "name": "Insert Data Table Row - Abandoned Calls - Sales - Exported 2024-02-04 @ 14:53",
+  "integrationType": "purecloud-data-actions",
+  "actionType": "custom",
+  "config": {
+    "request": {
+      "requestUrlTemplate": "/api/v2/flows/datatables/e982acd5-8b28-4cc0-993b-e628d7d8f8e0/rows",
+      "requestType": "POST",
+      "headers": {},
+      "requestTemplate": "${input.rawRequest}"
+    },
+    "response": {
+      "translationMap": {},
+      "translationMapDefaults": {},
+      "successTemplate": "${rawResult}"
+    }
+  },
+  "contract": {
+    "input": {
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "title": "Row update",
+        "description": "A Row update",
+        "type": "object",
+        "required": [
+          "Key"
+        ],
+        "properties": {
+          "Key": {
+            "description": "Tarjeta",
+            "type": "string"
+          },
+          "QueueID": {
+            "description": "Telefono origen",
+            "type": "string"
+          },
+          "LeadID": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "output": {
+      "successSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "title": "Row update",
+        "description": "returns the new row",
+        "type": "object",
+        "properties": {
+          "Key": {
+            "description": "Tarjeta",
+            "type": "string"
+          },
+          "QueueID": {
+            "description": "Telefono origen",
+            "type": "string"
+          },
+          "LeadID": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "secure": false
+}

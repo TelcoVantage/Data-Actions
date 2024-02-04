@@ -1,0 +1,59 @@
+{
+  "name": "Get_Idle_Agents_count (with skillse AUTrades) - Exported 2024-02-04 @ 14:52",
+  "integrationType": "purecloud-data-actions",
+  "actionType": "custom",
+  "config": {
+    "request": {
+      "requestUrlTemplate": "/api/v2/routing/queues/${input.QueueID}/users?joined=true&skills=AUTrades&routingStatus=IDLE",
+      "requestType": "GET",
+      "headers": {},
+      "requestTemplate": "${input.rawRequest}"
+    },
+    "response": {
+      "translationMap": {
+        "Agents_Logged_Into_Queue": "$.total"
+      },
+      "translationMapDefaults": {},
+      "successTemplate": "{\n \"Agents Logged Into Queue\": ${Agents_Logged_Into_Queue}\n}"
+    }
+  },
+  "contract": {
+    "input": {
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "title": "Get Number of Agents Logged Into Queue Request",
+        "description": "A user ID-based request.",
+        "type": "object",
+        "required": [
+          "QueueID"
+        ],
+        "properties": {
+          "QueueID": {
+            "description": "The queue ID.",
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "output": {
+      "successSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "title": "Get User Routing Status Response",
+        "description": "Agents_Logged_Into_Queue..",
+        "type": "object",
+        "required": [
+          "Agents Logged Into Queue"
+        ],
+        "properties": {
+          "Agents Logged Into Queue": {
+            "description": "Agents logged into queue. A value > 0 does not guarentee that an interaction sent to this queue will be answered. ",
+            "type": "number"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "secure": false
+}
