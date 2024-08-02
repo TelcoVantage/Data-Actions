@@ -7,7 +7,7 @@
       "requestUrlTemplate": "/api/v2/conversations/emails/agentless",
       "requestType": "POST",
       "headers": {},
-      "requestTemplate": "{\n   \"senderType\": \"Outbound\",\n   \"conversationId\": \"\",\n   \"fromAddress\": {\n     \"email\": \"alerts@telephony.employsure.com.au\",\n      \"name\": \"Genesys Cloud Alerting\"\n   },\n   \"toAddresses\": [\n      {\n         \"email\": \"richard.dib@employsure.com.au\",\n         \"name\": \"Richard Dib\"\n      }\n   ],\n   \"replyToAddress\": {\n      \"email\": \"alerts@employsure.com.au\",\n      \"name\": \"Richard Dib\"\n   },\n   \"subject\": \"${input.subject}\",\n   \"textBody\": \"${input.textbody}\",\n   \"htmlBody\": \"${input.htmlbody}\"\n}"
+      "requestTemplate": "{\n   \"senderType\": \"Outbound\",\n   \"conversationId\": \"\",\n   \"fromAddress\": {\n     \"email\": \"EMAIL@EMAIL>.COM\",\n      \"name\": \"Genesys Cloud Alerting\"\n   },\n   \"toAddresses\": [\n      {\n         \"email\": \"EMAIL@EMAIL.com\",\n         \"name\": \"Richard Dib\"\n      }\n   ],\n   \"replyToAddress\": {\n      \"email\": \"EMAIL@EMAIL.com\",\n      \"name\": \"Richard Dib\"\n   },\n   \"subject\": \"${input.subject}\",\n   \"textBody\": \"${input.textbody}\",\n   \"htmlBody\": \"${input.htmlbody}\"\n}"
     },
     "response": {
       "translationMap": {},
