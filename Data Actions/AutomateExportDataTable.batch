@@ -2,7 +2,7 @@
 SETLOCAL ENABLEDELAYEDEXPANSION
 
 :: Define the datatable ID
-SET datatableId=ab8ec66e-ce0e-490d-8e66-2cfa4a99faa0
+SET datatableId=DataTableID
 
 :: Define your clientId and clientSecret
 SET clientId={enter client id here}
