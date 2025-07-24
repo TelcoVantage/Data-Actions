@@ -1,0 +1,329 @@
+{
+  "name": "Get Most Recent Open Case By Contact Id - Exported 2025-07-25 @ 09-28",
+  "contract": {
+    "output": {
+      "successSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "type": "array",
+        "properties": {},
+        "items": {
+          "$schema": "http://json-schema.org/draft-04/schema#",
+          "title": "Case",
+          "type": "object",
+          "description": "A Salesforce case.",
+          "required": [
+            "Id"
+          ],
+          "properties": {
+            "Id": {
+              "description": "The ID of the case.",
+              "title": "Case ID",
+              "type": "string"
+            },
+            "AccountId": {
+              "description": "The Salesforce account ID.",
+              "title": "Account ID",
+              "type": "string"
+            },
+            "AssetId": {
+              "description": "The asset ID associated with case.",
+              "title": "Asset ID",
+              "type": "string"
+            },
+            "CaseNumber": {
+              "description": "The case number.",
+              "title": "Case Number",
+              "type": "string"
+            },
+            "ClosedDate": {
+              "description": "The close date of the case (UTC).",
+              "title": "Closed Date",
+              "type": "string"
+            },
+            "Contact": {
+              "description": "The contact information.",
+              "title": "Contact",
+              "type": "object",
+              "required": [
+                "Id"
+              ],
+              "properties": {
+                "Name": {
+                  "description": "The full name of the contact.",
+                  "title": "Name",
+                  "type": "string"
+                },
+                "FirstName": {
+                  "description": "The first name of the contact.",
+                  "title": "First Name",
+                  "type": "string"
+                },
+                "LastName": {
+                  "description": "The last name of the contact.",
+                  "title": "Last Name",
+                  "type": "string"
+                },
+                "Email": {
+                  "description": "The email address of the contact.",
+                  "title": "Email",
+                  "type": "string"
+                },
+                "Fax": {
+                  "description": "The fax number of the contact.",
+                  "title": "Fax Number",
+                  "type": "string"
+                },
+                "Id": {
+                  "description": "The ID of the contact.",
+                  "title": "Contact ID",
+                  "type": "string"
+                },
+                "Phone": {
+                  "description": "The phone number of the contact.",
+                  "title": "Phone",
+                  "type": "string"
+                }
+              }
+            },
+            "CreatedById": {
+              "description": "The ID of the creator of the case.",
+              "title": "Created By ID",
+              "type": "string"
+            },
+            "CreatedDate": {
+              "description": "The date that the case was created (UTC).",
+              "title": "Created Date",
+              "type": "string"
+            },
+            "Description": {
+              "description": "The description of the case.",
+              "title": "Description",
+              "type": "string"
+            },
+            "IsClosed": {
+              "description": "The closed property of the case.",
+              "title": "Is Closed",
+              "type": "boolean"
+            },
+            "IsDeleted": {
+              "description": "The deleted property of the case.",
+              "title": "Is Deleted",
+              "type": "boolean"
+            },
+            "IsEscalated": {
+              "description": "The escalated property of the case.",
+              "title": "Is Escalated",
+              "type": "boolean"
+            },
+            "LastModifiedById": {
+              "description": "The ID of the user who last modified the case.",
+              "title": "Last Modified By ID",
+              "type": "string"
+            },
+            "LastModifiedDate": {
+              "description": "The date of the last modification (UTC).",
+              "title": "Last Modified Date",
+              "type": "string"
+            },
+            "Origin": {
+              "description": "The origination of the case.",
+              "title": "Origin",
+              "type": "string"
+            },
+            "OwnerId": {
+              "description": "The ID of the case owner.",
+              "title": "Owner ID",
+              "type": "string"
+            },
+            "ParentId": {
+              "description": "The parent case ID, if there is a parent.",
+              "title": "Parent ID",
+              "type": "string"
+            },
+            "Priority": {
+              "description": "The priority property of the case.",
+              "title": "Priority",
+              "type": "string"
+            },
+            "Reason": {
+              "description": "The case reason.",
+              "title": "Reason",
+              "type": "string"
+            },
+            "Status": {
+              "description": "The status of the case.",
+              "title": "Status",
+              "type": "string"
+            },
+            "Subject": {
+              "description": "The subject of the case.",
+              "title": "Subject",
+              "type": "string"
+            },
+            "SuppliedCompany": {
+              "description": "The company name supplied with the case.",
+              "title": "Supplied Company",
+              "type": "string"
+            },
+            "SuppliedEmail": {
+              "description": "The email address supplied with the case.",
+              "title": "Supplied Email",
+              "type": "string"
+            },
+            "SuppliedName": {
+              "description": "The name supplied with the case.",
+              "title": "Supplied Name",
+              "type": "string"
+            },
+            "SuppliedPhone": {
+              "description": "The phone number supplied with the case.",
+              "title": "Supplied Phone",
+              "type": "string"
+            },
+            "SystemModstamp": {
+              "description": "The system modification time stamp.",
+              "title": "System Mod Stamp",
+              "type": "string"
+            },
+            "Type": {
+              "description": "The type of the case.",
+              "title": "Type",
+              "type": "string"
+            }
+          }
+        }
+      },
+      "errorSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "title": "ErrorBody",
+        "description": "Detailed information about an error response.",
+        "type": "object",
+        "required": [
+          "errorCode",
+          "status",
+          "userMessage"
+        ],
+        "properties": {
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "errorCode": {
+            "description": "A code unique to this error.",
+            "type": "string"
+          },
+          "status": {
+            "description": "The HTTP status code for this message (400, 401, 403, 404, 500, etc.)",
+            "type": "integer"
+          },
+          "correlationId": {
+            "description": "The correlation Id or context Id for this message. If left blank the Public API will look at the HTTP response header 'ININ-Correlation-Id' instead.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "entityId": {
+            "description": "The ID of the entity this error refers to. Only used in BackendErrorBody instances within the errors array.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "entityName": {
+            "description": "The name of the entity this error refers to. Only used in BackendErrorBody instances within the errors array.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "userMessage": {
+            "description": "A customer friendly message. This should be a complete sentence, use proper grammar and only include information useful to a customer. This is not a dev message and should not include things like Org Id",
+            "type": "string"
+          },
+          "userParamsMessage": {
+            "description": "This is the same as message except it uses template fields for variable replacement. For instance: 'User {username} was not found'",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "userParams": {
+            "description": "Used in conjunction with userParamsMessage. These are the template parameters. For instance: UserParam.key = 'username', UserParam.value = 'john.doe'",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "description": "Key name of userParam  pair.",
+                  "type": "string"
+                },
+                "value": {
+                  "description": "Value of userParam  pair.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "value"
+              ]
+            }
+          },
+          "details": {
+            "type": "array",
+            "items": {
+              "title": "ErrorDetail",
+              "type": "object",
+              "description": "",
+              "properties": {
+                "errorCode": {
+                  "type": "string"
+                },
+                "fieldName": {
+                  "type": "string"
+                },
+                "entityId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "entityName": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "errorCode",
+                "fieldName"
+              ]
+            }
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "input": {
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "title": "Contact ID Request",
+        "description": "A contact ID-based request.",
+        "type": "object",
+        "required": [
+          "CONTACT_ID"
+        ],
+        "properties": {
+          "CONTACT_ID": {
+            "type": "string",
+            "description": "The contact ID used to query Salesforce."
+          }
+        }
+      }
+    }
+  },
+  "secure": false
+}

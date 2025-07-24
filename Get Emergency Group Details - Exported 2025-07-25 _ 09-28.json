@@ -1,0 +1,275 @@
+{
+  "name": "Get Emergency Group Details - Exported 2025-07-25 @ 09-28",
+  "contract": {
+    "output": {
+      "successSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "type": "object",
+        "properties": {
+          "emergencyGroup_Ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "emergencyGroup_Name": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "ivrId1": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId10": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId11": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId12": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId13": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId14": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId15": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId16": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId17": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId18": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId19": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId2": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId20": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId3": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId4": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId5": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId6": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId7": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId8": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ivrId9": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "additionalProperties": true
+      },
+      "errorSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "title": "ErrorBody",
+        "description": "Detailed information about an error response.",
+        "type": "object",
+        "required": [
+          "errorCode",
+          "status",
+          "userMessage"
+        ],
+        "properties": {
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "errorCode": {
+            "description": "A code unique to this error.",
+            "type": "string"
+          },
+          "status": {
+            "description": "The HTTP status code for this message (400, 401, 403, 404, 500, etc.)",
+            "type": "integer"
+          },
+          "correlationId": {
+            "description": "The correlation Id or context Id for this message. If left blank the Public API will look at the HTTP response header 'ININ-Correlation-Id' instead.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "entityId": {
+            "description": "The ID of the entity this error refers to. Only used in BackendErrorBody instances within the errors array.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "entityName": {
+            "description": "The name of the entity this error refers to. Only used in BackendErrorBody instances within the errors array.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "userMessage": {
+            "description": "A customer friendly message. This should be a complete sentence, use proper grammar and only include information useful to a customer. This is not a dev message and should not include things like Org Id",
+            "type": "string"
+          },
+          "userParamsMessage": {
+            "description": "This is the same as message except it uses template fields for variable replacement. For instance: 'User {username} was not found'",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "userParams": {
+            "description": "Used in conjunction with userParamsMessage. These are the template parameters. For instance: UserParam.key = 'username', UserParam.value = 'john.doe'",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "description": "Key name of userParam  pair.",
+                  "type": "string"
+                },
+                "value": {
+                  "description": "Value of userParam  pair.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "value"
+              ]
+            }
+          },
+          "details": {
+            "type": "array",
+            "items": {
+              "title": "ErrorDetail",
+              "type": "object",
+              "description": "",
+              "properties": {
+                "errorCode": {
+                  "type": "string"
+                },
+                "fieldName": {
+                  "type": "string"
+                },
+                "entityId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "entityName": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "errorCode",
+                "fieldName"
+              ]
+            }
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "input": {
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "title": "GET EmergencyGroup info",
+        "description": "Check Emergency Group Status",
+        "type": "object",
+        "properties": {
+          "emergencyGroup_ID": {
+            "description": "Emergency Group ID",
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "secure": false
+}
