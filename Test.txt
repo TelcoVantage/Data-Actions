@@ -1,0 +1,114 @@
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# ========== CONFIGURATION ==========
+$clientId = "YOUR_CLIENT_ID"
+$clientSecret = "YOUR_CLIENT_SECRET"
+$region = "mypurecloud.com.au"
+$queueIds = @(
+    "QUEUE_ID_1",  # Replace with actual queue IDs
+    "QUEUE_ID_2"
+)
+
+# ========== AUTHENTICATION ==========
+function Get-AccessToken {
+    $authUri = "https://login.$region/oauth/token"
+    $body = @{
+        grant_type = "client_credentials"
+        client_id = $clientId
+        client_secret = $clientSecret
+    }
+
+    $response = Invoke-RestMethod -Method Post -Uri $authUri -ContentType "application/x-www-form-urlencoded" -Body $body
+    return $response.access_token
+}
+
+# ========== GET QUEUE STATS ==========
+function Get-QueueStats {
+    param (
+        [string]$accessToken
+    )
+
+    $queueData = @()
+
+    foreach ($queueId in $queueIds) {
+        $url = "https://api.$region/api/v2/routing/queues/$queueId/stats"
+        $headers = @{ Authorization = "Bearer $accessToken" }
+        $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
+
+        $queueInfo = @{
+            name = $response.name
+            callsWaiting = $response.calls.waiting
+        }
+
+        $queueData += $queueInfo
+    }
+
+    return $queueData
+}
+
+# ========== GENERATE HTML ==========
+function Generate-HTML {
+    param ([array]$queueStats)
+
+    $html = @"
+<html>
+<head>
+    <title>Genesys Cloud Wallboard</title>
+    <meta http-equiv='refresh' content='30'>
+    <style>
+        body { font-family: Arial; background: #111; color: #eee; text-align: center; }
+        h1 { color: #00e676; }
+        table { width: 60%; margin: auto; border-collapse: collapse; font-size: 24px; }
+        th, td { padding: 10px; border: 1px solid #666; }
+        th { background: #333; }
+        td.callsWaiting { color: #ff5252; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>Genesys Cloud Queue Wallboard</h1>
+    <table>
+        <tr><th>Queue Name</th><th>Calls Waiting</th></tr>
+"@
+
+    foreach ($queue in $queueStats) {
+        $html += "<tr><td>$($queue.name)</td><td class='callsWaiting'>$($queue.callsWaiting)</td></tr>`n"
+    }
+
+    $html += @"
+    </table>
+</body>
+</html>
+"@
+
+    return $html
+}
+
+# ========== DISPLAY HTML IN WEB VIEW ==========
+function Show-Wallboard {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Genesys Wallboard"
+    $form.Width = 800
+    $form.Height = 600
+
+    $browser = New-Object System.Windows.Forms.WebBrowser
+    $browser.Dock = "Fill"
+
+    $form.Controls.Add($browser)
+
+    $accessToken = Get-AccessToken
+    $queueStats = Get-QueueStats -accessToken $accessToken
+    $htmlContent = Generate-HTML -queueStats $queueStats
+
+    $tempFile = [System.IO.Path]::GetTempFileName() + ".html"
+    Set-Content -Path $tempFile -Value $htmlContent -Encoding UTF8
+
+    $browser.Navigate("file:///" + $tempFile.Replace("\", "/"))
+
+    $form.TopMost = $true
+    $form.Add_Shown({ $form.Activate() })
+    [void]$form.ShowDialog()
+}
+
+# ========== RUN ==========
+Show-Wallboard
