@@ -1,0 +1,137 @@
+{
+  "name": "Put on queue - Exported 2025-07-25 @ 09-28",
+  "contract": {
+    "output": {
+      "successSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true
+      },
+      "errorSchema": {
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "title": "ErrorBody",
+        "description": "Detailed information about an error response.",
+        "type": "object",
+        "required": [
+          "errorCode",
+          "status",
+          "userMessage"
+        ],
+        "properties": {
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "errorCode": {
+            "description": "A code unique to this error.",
+            "type": "string"
+          },
+          "status": {
+            "description": "The HTTP status code for this message (400, 401, 403, 404, 500, etc.)",
+            "type": "integer"
+          },
+          "correlationId": {
+            "description": "The correlation Id or context Id for this message. If left blank the Public API will look at the HTTP response header 'ININ-Correlation-Id' instead.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "entityId": {
+            "description": "The ID of the entity this error refers to. Only used in BackendErrorBody instances within the errors array.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "entityName": {
+            "description": "The name of the entity this error refers to. Only used in BackendErrorBody instances within the errors array.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "userMessage": {
+            "description": "A customer friendly message. This should be a complete sentence, use proper grammar and only include information useful to a customer. This is not a dev message and should not include things like Org Id",
+            "type": "string"
+          },
+          "userParamsMessage": {
+            "description": "This is the same as message except it uses template fields for variable replacement. For instance: 'User {username} was not found'",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "userParams": {
+            "description": "Used in conjunction with userParamsMessage. These are the template parameters. For instance: UserParam.key = 'username', UserParam.value = 'john.doe'",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "description": "Key name of userParam  pair.",
+                  "type": "string"
+                },
+                "value": {
+                  "description": "Value of userParam  pair.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "value"
+              ]
+            }
+          },
+          "details": {
+            "type": "array",
+            "items": {
+              "title": "ErrorDetail",
+              "type": "object",
+              "description": "",
+              "properties": {
+                "errorCode": {
+                  "type": "string"
+                },
+                "fieldName": {
+                  "type": "string"
+                },
+                "entityId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "entityName": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "errorCode",
+                "fieldName"
+              ]
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "input": {
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "userId": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "secure": false
+}
