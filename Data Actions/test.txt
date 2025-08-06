@@ -37,3 +37,10 @@
     }
   }
 }
+
+
+
+_api/web/lists/getbytitle('Site Pages')/items?
+$filter=startswith(FileRef,'/sites/service-HumanResources/SitePages/Grow')
+&$select=Title,CanvasContent1,BannerImageUrl,Description,LayoutWebpartsContent,FileRef,File/ServerRelativeUrl
+&$expand=File
