@@ -1,0 +1,39 @@
+{
+  "type": "object",
+  "properties": {
+    "value": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "Title": {
+            "type": "string"
+          },
+          "CanvasContent1": {
+            "type": "string"
+          },
+          "BannerImageUrl": {
+            "type": "string"
+          },
+          "Description": {
+            "type": "string"
+          },
+          "LayoutWebpartsContent": {
+            "type": "string"
+          },
+          "FileRef": {
+            "type": "string"
+          },
+          "File": {
+            "type": "object",
+            "properties": {
+              "ServerRelativeUrl": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
