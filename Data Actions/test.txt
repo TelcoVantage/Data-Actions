@@ -44,3 +44,15 @@ _api/web/lists/getbytitle('Site Pages')/items?
 $filter=startswith(FileRef,'/sites/service-HumanResources/SitePages/Grow')
 &$select=Title,CanvasContent1,BannerImageUrl,Description,LayoutWebpartsContent,FileRef,File/ServerRelativeUrl
 &$expand=File
+
+
+
+concat(
+    '<div>',
+    '<h2>', if(empty(item()?['Title']), '', item()?['Title']), '</h2>',
+    if(empty(item()?['BannerImageUrl']), '', concat('<img src="', item()?['BannerImageUrl'], '" style="width:100%;max-height:300px;object-fit:cover;"/>')),
+    if(empty(item()?['Description']), '', concat('<p><em>', item()?['Description'], '</em></p>')),
+    item()?['CanvasContent1'],
+    if(empty(item()?['LayoutWebpartsContent']), '', concat('<div>', item()?['LayoutWebpartsContent'], '</div>')),
+    '</div>'
+)
