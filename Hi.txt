@@ -1,0 +1,17 @@
+# Replace with your Power BI Push URL
+$pushUrl = "https://api.powerbi.com/beta/YOUR_WORKSPACE_ID/datasets/YOUR_DATASET_ID/rows?key=YOUR_KEY"
+
+# Create a row
+$row = @{
+    DateTime       = (Get-Date).ToString("s")  # ISO 8601 format
+    ConversationId = "TestConv001"
+    NPS            = 9
+}
+
+# Wrap in 'rows' array
+$payload = @{ rows = @($row) } | ConvertTo-Json -Depth 3
+
+# Send to Power BI
+Invoke-RestMethod -Uri $pushUrl -Method Post -ContentType "application/json" -Body $payload
+
+Write-Host "Data pushed to Power BI."
