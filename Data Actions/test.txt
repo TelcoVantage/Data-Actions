@@ -1,6 +1,6 @@
 <# 
-    Genesys Cloud – Pull audits for a single user (last 12 days) 111111111111111111
-    - Queries both:
+    Genesys Cloud – Pull audits for a single user (last 12 days)
+    - Queries both: updated
         A) events performed by the user (actor)
         B) events targeting that user as the entity
     - Asynchronous Audits API flow:
@@ -11,11 +11,11 @@
 #>
 
 # ------------------- CONFIG: FILL THESE -------------------
-$CLIENT_ID     = "<PUT_YOUR_CLIENT_ID_HERE>"
-$CLIENT_SECRET = "<PUT_YOUR_CLIENT_SECRET_HERE>"
-$ORG_REGION    = "mypurecloud.com.au"   # e.g., mypurecloud.com, mypurecloud.ie, etc.
+$CLIENT_ID      = "<PUT_YOUR_CLIENT_ID_HERE>"
+$CLIENT_SECRET  = "<PUT_YOUR_CLIENT_SECRET_HERE>"
+$ORG_REGION     = "mypurecloud.com.au"   # e.g., mypurecloud.com, mypurecloud.ie, etc.
 $TARGET_USER_ID = "<PUT_TARGET_USER_GUID_HERE>"
-$DAYS_BACK = 12
+$DAYS_BACK      = 12
 # ------------------- END CONFIG ---------------------------
 
 # ---------- Time interval (UTC) ----------
@@ -143,7 +143,8 @@ $flat = $all | ForEach-Object {
             $n = $_.property
             $o = if ($_.oldValues) { ($_.oldValues -join "|") } else { "" }
             $v = if ($_.newValues) { ($_.newValues -join "|") } else { "" }
-            "$n: $o -> $v"
+            # IMPORTANT: avoid "$n:" etc. Use format string:
+            "{0}: {1} -> {2}" -f $n, $o, $v
         }) -join "; "
     }
     [pscustomobject]@{
