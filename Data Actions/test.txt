@@ -1,6 +1,6 @@
 <# 
     Genesys Cloud – Pull audits for a single user (last 12 days)
-    - Queries both: updated
+    - Queries both:
         A) events performed by the user (actor)
         B) events targeting that user as the entity
     - Asynchronous Audits API flow:
@@ -21,12 +21,13 @@ $DAYS_BACK      = 12
 # ---------- Time interval (UTC) ----------
 $nowUtc   = (Get-Date).ToUniversalTime()
 $startUtc = $nowUtc.AddDays(-$DAYS_BACK)
-$interval = "{0}/{1}" -f ($startUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")), ($nowUtc.ToString("yyyy-MM-ddTHH:mm:ssZ"))
+# Using the "o" round-trip format specifier is the most robust way to create ISO-8601 timestamps
+$interval = "{0}/{1}" -f ($startUtc.ToString("o")), ($nowUtc.ToString("o"))
 
 # ---------- OAuth: Client Credentials ----------
 $tokenUrl = "https://login.$ORG_REGION/oauth/token"
 $pair     = "{0}:{1}" -f $CLIENT_ID, $CLIENT_SECRET
-$basic    = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+$basic    = [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes($pair))
 $headers  = @{ "Authorization" = "Basic $basic" }
 
 try {
@@ -49,6 +50,7 @@ function Start-AuditQuery {
     $url = "$apiBase/api/v2/audits/query"
     $json = ($Body | ConvertTo-Json -Depth 10)
     try {
+        # Using Invoke-WebRequest to handle the expected 202 status code correctly
         $resp = Invoke-WebRequest -Method Post -Uri $url -Headers $authz -Body $json
         if ($resp.StatusCode -ne 202) { throw "Unexpected status code: $($resp.StatusCode) body: $($resp.Content)" }
         ($resp.Content | ConvertFrom-Json).id
@@ -62,12 +64,13 @@ function Wait-AuditQueryReady {
         [int] $PollMs = 1200
     )
     $statusUrl = "$apiBase/api/v2/audits/query/$TransactionId"
-    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
         try {
             $s = Invoke-RestMethod -Method Get -Uri $statusUrl -Headers $authz
-            if ($s.state -in @("Complete","Succeeded")) { return $true }
-            if ($s.state -in @("Failed","Cancelled","TimedOut")) { throw "Query state: $($s.state). Message: $($s.errorMessage)" }
+            # FIX: Using the exact state values from the API documentation for precision.
+            if ($s.state -eq "SUCCEEDED") { return $true }
+            if ($s.state -in @("FAILED", "CANCELLED")) { throw "Query state: $($s.state). Message: $($s.errorMessage)" }
         } catch { throw "Status check failed: $($_.Exception.Message)" }
         Start-Sleep -Milliseconds $PollMs
     }
@@ -81,16 +84,24 @@ function Get-AuditResultsAllPages {
     while ($true) {
         $resp = Invoke-RestMethod -Method Get -Uri $url -Headers $authz
         if ($resp.entities) { $results += $resp.entities }
+        # The 'nextUri' is a relative path, so it must be combined with the apiBase
         if ($resp.nextUri) { $url = "$apiBase$($resp.nextUri)" } else { break }
     }
     $results
 }
 
 # ---------- Build two queries ----------
+Write-Host "Building audit queries for user $TARGET_USER_ID..."
+Write-Host "Interval: $interval"
+
 # Actor = events performed BY the user
+# FIX: The query for actor events was using an incorrect body structure.
+# The API requires a 'filters' array to specify the acting user via the 'UserId' property.
 $bodyActor = @{
     interval = $interval
-    userIds  = @($TARGET_USER_ID)   # actor filter
+    filters  = @(
+        @{ property = "UserId"; values = @($TARGET_USER_ID) }
+    )
     pageSize = 100
 }
 
@@ -104,7 +115,7 @@ $bodyEntity = @{
     pageSize = 100
 }
 
-Write-Host "Submitting audit queries for interval $interval ..."
+Write-Host "`nSubmitting audit queries..."
 
 try {
     $txActor  = Start-AuditQuery -Body $bodyActor
@@ -113,9 +124,11 @@ try {
     Write-Host "Actor transactionId : $txActor"
     Write-Host "Entity transactionId: $txEntity"
 
+    Write-Host "Waiting for queries to complete..."
     [void](Wait-AuditQueryReady -TransactionId $txActor)
     [void](Wait-AuditQueryReady -TransactionId $txEntity)
-
+    
+    Write-Host "Fetching results..."
     $actorEvents  = Get-AuditResultsAllPages -TransactionId $txActor
     $entityEvents = Get-AuditResultsAllPages -TransactionId $txEntity
 } catch { Write-Error $_; exit 1 }
@@ -125,7 +138,7 @@ $all = @($actorEvents + $entityEvents) | Group-Object id | ForEach-Object { $_.G
        Sort-Object -Property timestamp -Descending
 
 if (-not $all -or $all.Count -eq 0) {
-    Write-Host "No audit events found for user $TARGET_USER_ID in the last $DAYS_BACK days."
+    Write-Host "`nNo audit events found for user $TARGET_USER_ID in the last $DAYS_BACK days."
     return
 }
 
@@ -143,8 +156,8 @@ $flat = $all | ForEach-Object {
             $n = $_.property
             $o = if ($_.oldValues) { ($_.oldValues -join "|") } else { "" }
             $v = if ($_.newValues) { ($_.newValues -join "|") } else { "" }
-            # IMPORTANT: avoid "$n:" etc. Use format string:
-            "{0}: {1} -> {2}" -f $n, $o, $v
+            # Use a format string to prevent errors if values contain special characters
+            "{0}: '{1}' -> '{2}'" -f $n, $o, $v
         }) -join "; "
     }
     [pscustomobject]@{
@@ -152,10 +165,10 @@ $flat = $all | ForEach-Object {
         ServiceName   = $_.serviceName
         Action        = $_.action
         EntityType    = $_.entityType
-        EntityId      = $_.entityId
         EntityName    = $_.entityName
-        UserId        = $_.userId
-        UserName      = $_.userName
+        EntityId      = $_.entityId
+        UserName      = $_.userName # Actor Name
+        UserId        = $_.userId   # Actor ID
         CorrelationId = $_.correlationId
         IPAddress     = $_.ipAddress
         Application   = $_.application
@@ -165,6 +178,6 @@ $flat = $all | ForEach-Object {
 
 $flat | Export-Csv -NoTypeInformation -Encoding UTF8 -Path "$baseOut.csv"
 
-Write-Host "`nDone."
+Write-Host "`nDone. Found $($all.Count) events."
 Write-Host "JSON: $baseOut.json"
 Write-Host "CSV : $baseOut.csv"
