@@ -1,17 +1,214 @@
-# Replace with your Power BI Push URL
-$pushUrl = "https://api.powerbi.com/beta/YOUR_WORKSPACE_ID/datasets/YOUR_DATASET_ID/rows?key=YOUR_KEY"
+<# 
+    Genesys Cloud – Pull audits for a single user (last 12 days)
+    - Queries both:
+        A) events performed by the user (actor)
+        B) events targeting that user as the entity
+    - Asynchronous Audits API flow:
+        POST  /api/v2/audits/query     -> 202 + transactionId
+        GET   /api/v2/audits/query/{transactionId}
+        GET   /api/v2/audits/query/{transactionId}/results (with nextUri paging)
+    - Outputs: audits_{USERID}_YYYYMMDD_HHmm.csv and .json in the working folder
+#>
 
-# Create a row
-$row = @{
-    DateTime       = (Get-Date).ToString("s")  # ISO 8601 format
-    ConversationId = "TestConv001"
-    NPS            = 9
+# ------------------- CONFIG: FILL THESE -------------------
+$CLIENT_ID     = "<PUT_YOUR_CLIENT_ID_HERE>"
+$CLIENT_SECRET = "<PUT_YOUR_CLIENT_SECRET_HERE>"
+
+# Your org region base (AU example below). Other examples:
+# US East: mypurecloud.com, EU West: mypurecloud.ie, AP Northeast: mypurecloud.jp, etc.
+$ORG_REGION    = "mypurecloud.com.au"
+
+# The Genesys Cloud userId (GUID) you want to search for:
+$TARGET_USER_ID = "<PUT_TARGET_USER_GUID_HERE>"
+
+# Days back to search (inclusive of now)
+$DAYS_BACK = 12
+# ------------------- END CONFIG ---------------------------
+
+# ---------- Helper: ISO8601 interval (UTC) for last N days ----------
+$nowUtc   = (Get-Date).ToUniversalTime()
+$startUtc = $nowUtc.AddDays(-$DAYS_BACK)
+$interval = "{0}/{1}" -f ($startUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")), ($nowUtc.ToString("yyyy-MM-ddTHH:mm:ssZ"))
+
+# ---------- OAuth: Client Credentials ----------
+$tokenUrl = "https://login.$ORG_REGION/oauth/token"
+$basic    = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$CLIENT_ID`:$CLIENT_SECRET"))
+$headers  = @{ "Authorization" = "Basic $basic" }
+
+try {
+    $tokenResp = Invoke-RestMethod -Method Post -Uri $tokenUrl -Headers $headers `
+        -ContentType "application/x-www-form-urlencoded" -Body "grant_type=client_credentials"
+} catch {
+    Write-Error "Failed to obtain token. Check client ID/secret/region and client roles. $($_.Exception.Message)"
+    exit 1
 }
 
-# Wrap in 'rows' array
-$payload = @{ rows = @($row) } | ConvertTo-Json -Depth 3
+$accessToken = $tokenResp.access_token
+if (-not $accessToken) {
+    Write-Error "No access_token in token response."
+    exit 1
+}
 
-# Send to Power BI
-Invoke-RestMethod -Uri $pushUrl -Method Post -ContentType "application/json" -Body $payload
+# ---------- Common API setup ----------
+$apiBase   = "https://api.$ORG_REGION"
+$authz     = @{ "Authorization" = "Bearer $accessToken" ; "Content-Type" = "application/json" }
 
-Write-Host "Data pushed to Power BI."
+function Start-AuditQuery {
+    param(
+        [Parameter(Mandatory)] [hashtable] $Body
+    )
+    $url = "$apiBase/api/v2/audits/query"
+    $json = ($Body | ConvertTo-Json -Depth 10)
+    try {
+        # Expecting HTTP 202 with transactionId
+        $resp = Invoke-WebRequest -Method Post -Uri $url -Headers $authz -Body $json
+        if ($resp.StatusCode -ne 202) {
+            throw "Unexpected status code: $($resp.StatusCode) body: $($resp.Content)"
+        }
+        # The 202 body contains {"id":"<transactionId>"}
+        $obj = $resp.Content | ConvertFrom-Json
+        return $obj.id
+    } catch {
+        throw "Audit query create failed: $($_.Exception.Message)"
+    }
+}
+
+function Wait-AuditQueryReady {
+    param(
+        [Parameter(Mandatory)] [string] $TransactionId,
+        [int] $TimeoutSec = 120,
+        [int] $PollMs = 1200
+    )
+    $statusUrl = "$apiBase/api/v2/audits/query/$TransactionId"
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        try {
+            $s = Invoke-RestMethod -Method Get -Uri $statusUrl -Headers $authz
+            # states usually: "Queued", "Running", "Succeeded" (or "Complete"), "Failed"
+            if ($s.state -in @("Complete","Succeeded")) { return $true }
+            if ($s.state -in @("Failed","Cancelled","TimedOut")) {
+                throw "Query state: $($s.state). Message: $($s.errorMessage)"
+            }
+        } catch {
+            throw "Status check failed: $($_.Exception.Message)"
+        }
+        Start-Sleep -Milliseconds $PollMs
+    }
+    throw "Timed out waiting for audit query to complete."
+}
+
+function Get-AuditResultsAllPages {
+    param(
+        [Parameter(Mandatory)] [string] $TransactionId
+    )
+    $results = @()
+    $url = "$apiBase/api/v2/audits/query/$TransactionId/results"
+
+    while ($true) {
+        $resp = Invoke-RestMethod -Method Get -Uri $url -Headers $authz
+        if ($resp.entities) {
+            $results += $resp.entities
+        }
+        if ($resp.nextUri) {
+            # nextUri is a relative path beginning with /api/v2/...
+            $url = "$apiBase$($resp.nextUri)"
+        } else {
+            break
+        }
+    }
+    return $results
+}
+
+# ---------- Build two queries ----------
+# A) Events performed BY the user (actor)
+$bodyActor = @{
+    interval = $interval
+    # userIds filters the actor (who performed the action)
+    userIds  = @($TARGET_USER_ID)
+    pageSize = 100
+    sort     = @(@{ name = "Timestamp"; sortOrder = "descending" })
+}
+
+# B) Events where the user is the target ENTITY (their record changed)
+#    Using filters for EntityType=User and EntityId=<user>
+$bodyEntity = @{
+    interval = $interval
+    filters  = @(
+        @{ property = "EntityType"; value = "User" },
+        @{ property = "EntityId";   value = $TARGET_USER_ID }
+    )
+    pageSize = 100
+    sort     = @(@{ name = "Timestamp"; sortOrder = "descending" })
+}
+
+Write-Host "Submitting audit queries for interval $interval ..."
+
+try {
+    $txActor  = Start-AuditQuery -Body $bodyActor
+    $txEntity = Start-AuditQuery -Body $bodyEntity
+
+    Write-Host "Actor transactionId : $txActor"
+    Write-Host "Entity transactionId: $txEntity"
+
+    [void](Wait-AuditQueryReady -TransactionId $txActor)
+    [void](Wait-AuditQueryReady -TransactionId $txEntity)
+
+    $actorEvents  = Get-AuditResultsAllPages -TransactionId $txActor
+    $entityEvents = Get-AuditResultsAllPages -TransactionId $txEntity
+} catch {
+    Write-Error $_
+    exit 1
+}
+
+# ---------- Merge, de-dup (by id), sort ----------
+$all = @($actorEvents + $entityEvents) | Group-Object id | ForEach-Object { $_.Group[0] } |
+       Sort-Object -Property timestamp -Descending
+
+if (-not $all -or $all.Count -eq 0) {
+    Write-Host "No audit events found for user $TARGET_USER_ID in the last $DAYS_BACK days."
+    return
+}
+
+# ---------- Prepare outputs ----------
+$stamp   = (Get-Date).ToString("yyyyMMdd_HHmm")
+$baseOut = "audits_$($TARGET_USER_ID)_$stamp"
+
+# Save raw JSON
+$all | ConvertTo-Json -Depth 20 | Out-File -Encoding UTF8 -FilePath "$baseOut.json"
+
+# Flatten to CSV-friendly rows
+$flat = $all | ForEach-Object {
+    $pc = $_.propertyChanges
+    $changes = $null
+    if ($pc) {
+        # Join property changes into a readable string: "name: old -> new"
+        $changes = ($pc | ForEach-Object {
+            $n = $_.property
+            $o = if ($_.oldValues) { ($_.oldValues -join "|") } else { "" }
+            $v = if ($_.newValues) { ($_.newValues -join "|") } else { "" }
+            "$n: $o -> $v"
+        }) -join "; "
+    }
+
+    [pscustomobject]@{
+        Timestamp     = $_.timestamp
+        ServiceName   = $_.serviceName
+        Action        = $_.action
+        EntityType    = $_.entityType
+        EntityId      = $_.entityId
+        EntityName    = $_.entityName
+        UserId        = $_.userId
+        UserName      = $_.userName
+        CorrelationId = $_.correlationId
+        IPAddress     = $_.ipAddress
+        Application   = $_.application
+        Changes       = $changes
+    }
+}
+
+$flat | Export-Csv -NoTypeInformation -Encoding UTF8 -Path "$baseOut.csv"
+
+Write-Host ""
+Write-Host "Done."
+Write-Host "JSON: $baseOut.json"
+Write-Host "CSV : $baseOut.csv"
