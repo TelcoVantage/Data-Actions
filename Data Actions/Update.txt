@@ -1,0 +1,45 @@
+{
+  "name": "CountEmailsFromAddress",
+  "integrationId": null,
+  "integrationType": {
+    "id": "purecloud-data-actions"
+  },
+  "secure": false,
+  "contract": {
+    "input": {
+      "emailAddress": {
+        "type": "string",
+        "description": "Sender email to count (case-insensitive match). Example: someone@example.com",
+        "required": true
+      },
+      "interval": {
+        "type": "string",
+        "description": "ISO-8601 time interval. Example: 2025-07-01T00:00:00.000+10:00/2025-08-14T23:59:59.999+10:00",
+        "required": true
+      }
+    },
+    "output": {
+      "count": {
+        "type": "integer",
+        "description": "Total number of email conversations from the specified address in the interval."
+      }
+    }
+  },
+  "config": {
+    "request": {
+      "requestUrlTemplate": "https://api.mypurecloud.com.au/api/v2/analytics/conversations/details/query",
+      "requestType": "POST",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "requestTemplate": "{\n  \"interval\": \"${input.interval}\",\n  \"paging\": { \"pageSize\": 1, \"pageNumber\": 1 },\n  \"order\": \"asc\",\n  \"orderBy\": \"conversationStart\",\n  \"returnFields\": [\"conversationId\"],\n  \"segmentFilters\": [\n    {\n      \"type\": \"and\",\n      \"predicates\": [\n        { \"type\": \"dimension\", \"dimension\": \"mediaType\", \"operator\": \"matches\", \"value\": \"email\" }\n      ]\n    }\n  ],\n  \"conversationFilters\": [\n    {\n      \"type\": \"and\",\n      \"predicates\": [\n        { \"type\": \"dimension\", \"dimension\": \"addressFrom\", \"operator\": \"matches\", \"value\": \"${input.emailAddress}\" }\n      ]\n    }\n  ]\n}"
+    },
+    "response": {
+      "translationMap": {},
+      "translationMapDefaults": {},
+      "successTemplate": "{\n  \"count\": ${body.totalHits}\n}"
+    }
+  },
+  "secureConfig": [],
+  "schemas": {}
+}
