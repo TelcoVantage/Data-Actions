@@ -1,9 +1,5 @@
-{
-  "type": "object",
-  "properties": {
-    "jobId": { "type": "string" },
-    "state": { "type": "string" },
-    "selfUri": { "type": "string" }
-  },
-  "required": ["jobId", "selfUri"]
-}
+@if(
+  startsWith(body('Parse_Start')?['selfUri'], 'http'),
+  body('Parse_Start')?['selfUri'],
+  concat('https://api.mypurecloud.com.au', body('Parse_Start')?['selfUri'])
+)
