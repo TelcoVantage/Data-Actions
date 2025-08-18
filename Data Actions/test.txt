@@ -11,3 +11,4 @@ https://api.mypurecloud.com.au/api/v2/workforcemanagement/adherence/historical/b
   },
   "required": ["state"]
 }
+https://api.mypurecloud.com.au/api/v2/workforcemanagement/adherence/historical/bulk/jobs/@{body('Parse_Start')?['jobId']}
