@@ -1,12 +1,9 @@
-GET https://api.mypurecloud.com.au/api/v2/workforcemanagement/adherence/historical/bulk/jobs/@{body('Parse_Start')?['jobId']}
-Authorization: Bearer @{body('Parse_Token')?['access_token']}
-
-
-
-GET /api/v2/workforcemanagement/adherence/historical/bulk/jobs/{jobId}
-
-
-https://api.mypurecloud.com.au/api/v2/workforcemanagement/adherence/historical/bulk/jobs/@{trim(body('Parse_Start')?['jobId'])}
-
-
-
+{
+  "type": "object",
+  "properties": {
+    "jobId": { "type": "string" },
+    "state": { "type": "string" },
+    "selfUri": { "type": "string" }
+  },
+  "required": ["jobId", "selfUri"]
+}
