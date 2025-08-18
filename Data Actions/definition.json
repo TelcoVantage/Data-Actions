@@ -1,0 +1,405 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "$connections": {
+      "defaultValue": {},
+      "type": "Object"
+    },
+    "ExcelFileLocation": {
+      "type": "string",
+      "defaultValue": "OneDriveForBusiness"
+    },
+    "ExcelDriveId": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "ExcelFileId": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "ExcelTableName": {
+      "type": "string",
+      "defaultValue": "AdherenceData"
+    },
+    "GenesysRegionBase": {
+      "type": "string",
+      "defaultValue": "https://api.mypurecloud.com.au"
+    },
+    "GenesysAuthBase": {
+      "type": "string",
+      "defaultValue": "https://login.mypurecloud.com.au"
+    },
+    "GenesysClientId": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "GenesysClientSecret": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "TimeZone": {
+      "type": "string",
+      "defaultValue": "Australia/Sydney"
+    }
+  },
+  "triggers": {
+    "Every_day_0605_AEST": {
+      "type": "Recurrence",
+      "recurrence": {
+        "frequency": "Day",
+        "interval": 1,
+        "startTime": "06:05:00",
+        "timeZone": "@parameters('TimeZone')"
+      }
+    }
+  },
+  "actions": {
+    "Compose_Targets": {
+      "type": "Compose",
+      "inputs": {
+        "timeZone": "@parameters('TimeZone')",
+        "managementUnitIds": [
+          "<REPLACE_WITH_MU_ID>"
+        ],
+        "userIds": []
+      },
+      "runAfter": {}
+    },
+    "Compose_DateRange": {
+      "type": "Compose",
+      "inputs": {
+        "start": "@{formatDateTime(addDays(convertTimeZone(utcNow(),'UTC', parameters('TimeZone')), -1), 'yyyy-MM-dd')}",
+        "end": "@{formatDateTime(addDays(convertTimeZone(utcNow(),'UTC', parameters('TimeZone')), -1), 'yyyy-MM-dd')}"
+      },
+      "runAfter": {}
+    },
+    "HTTP_Get_Token": {
+      "type": "Http",
+      "inputs": {
+        "method": "POST",
+        "uri": "@{concat(parameters('GenesysAuthBase'), '/oauth/token')}",
+        "headers": {
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        "body": "@{concat('grant_type=client_credentials&client_id=', parameters('GenesysClientId'), '&client_secret=', parameters('GenesysClientSecret'))}"
+      },
+      "runAfter": {}
+    },
+    "Parse_Token": {
+      "type": "ParseJson",
+      "runAfter": {
+        "HTTP_Get_Token": [
+          "Succeeded"
+        ]
+      },
+      "inputs": {
+        "content": "@{body('HTTP_Get_Token')}",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "access_token": {
+              "type": "string"
+            },
+            "token_type": {
+              "type": "string"
+            },
+            "expires_in": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "access_token"
+          ]
+        }
+      }
+    },
+    "Start_Bulk_Job": {
+      "type": "Http",
+      "runAfter": {
+        "Parse_Token": [
+          "Succeeded"
+        ]
+      },
+      "inputs": {
+        "method": "POST",
+        "uri": "@{concat(parameters('GenesysRegionBase'), '/api/v2/workforcemanagement/adherence/historical/bulk')}",
+        "headers": {
+          "Authorization": "@{concat('Bearer ', body('Parse_Token')?['access_token'])}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "timeZone": "@{outputs('Compose_Targets')?['timeZone']}",
+          "includeExceptions": true,
+          "includeExplanations": true,
+          "includeAggregateCounts": true,
+          "groups": [
+            {
+              "managementUnitIds": "@{outputs('Compose_Targets')?['managementUnitIds']}",
+              "userIds": "@{outputs('Compose_Targets')?['userIds']}",
+              "startDate": "@{outputs('Compose_DateRange')?['start']}",
+              "endDate": "@{outputs('Compose_DateRange')?['end']}"
+            }
+          ]
+        }
+      }
+    },
+    "Parse_Start": {
+      "type": "ParseJson",
+      "runAfter": {
+        "Start_Bulk_Job": [
+          "Succeeded"
+        ]
+      },
+      "inputs": {
+        "content": "@{body('Start_Bulk_Job')}",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "jobId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "jobId"
+          ]
+        }
+      }
+    },
+    "Initialize_JobState": {
+      "type": "InitializeVariable",
+      "runAfter": {
+        "Parse_Start": [
+          "Succeeded"
+        ]
+      },
+      "inputs": {
+        "variables": [
+          {
+            "name": "JobState",
+            "type": "string",
+            "value": "Queued"
+          }
+        ]
+      }
+    },
+    "Until_Complete": {
+      "type": "Until",
+      "expression": "@equals(variables('JobState'),'Complete')",
+      "limit": {
+        "count": 60,
+        "timeout": "PT15M"
+      },
+      "actions": {
+        "HTTP_Get_Job": {
+          "type": "Http",
+          "inputs": {
+            "method": "GET",
+            "uri": "@{concat(parameters('GenesysRegionBase'), '/api/v2/workforcemanagement/adherence/historical/bulk/jobs/', body('Parse_Start')?['jobId'])}",
+            "headers": {
+              "Authorization": "@{concat('Bearer ', body('Parse_Token')?['access_token'])}"
+            }
+          }
+        },
+        "Parse_Job": {
+          "type": "ParseJson",
+          "runAfter": {
+            "HTTP_Get_Job": [
+              "Succeeded"
+            ]
+          },
+          "inputs": {
+            "content": "@{body('HTTP_Get_Job')}",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "state": {
+                  "type": "string"
+                },
+                "errorMessage": {
+                  "type": "string"
+                },
+                "downloadUrls": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "state"
+              ]
+            }
+          }
+        },
+        "If_Failed": {
+          "type": "If",
+          "expression": "@equals(body('Parse_Job')?['state'],'Failed')",
+          "actions": {
+            "Terminate_Failed": {
+              "type": "Terminate",
+              "inputs": {
+                "runStatus": "Failed",
+                "runError": {
+                  "message": "@{coalesce(body('Parse_Job')?['errorMessage'], 'Historical adherence job failed.')}"
+                }
+              }
+            }
+          }
+        },
+        "Set_JobState": {
+          "type": "SetVariable",
+          "runAfter": {
+            "Parse_Job": [
+              "Succeeded"
+            ]
+          },
+          "inputs": {
+            "name": "JobState",
+            "value": "@{body('Parse_Job')?['state']}"
+          }
+        },
+        "Delay_15s": {
+          "type": "Wait",
+          "runAfter": {
+            "Set_JobState": [
+              "Succeeded"
+            ]
+          },
+          "inputs": {
+            "seconds": 15
+          }
+        }
+      },
+      "runAfter": {
+        "Initialize_JobState": [
+          "Succeeded"
+        ]
+      }
+    },
+    "ForEach_DownloadUrl": {
+      "type": "Foreach",
+      "runAfter": {
+        "Until_Complete": [
+          "Succeeded"
+        ]
+      },
+      "foreach": "@{coalesce(body('Parse_Job')?['downloadUrls'], array())}",
+      "actions": {
+        "HTTP_Download": {
+          "type": "Http",
+          "inputs": {
+            "method": "GET",
+            "uri": "@{item()}"
+          }
+        },
+        "Parse_Result_Array": {
+          "type": "ParseJson",
+          "runAfter": {
+            "HTTP_Download": [
+              "Succeeded"
+            ]
+          },
+          "inputs": {
+            "content": "@{body('HTTP_Download')}",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "user": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "team": {
+                        "type": "string"
+                      },
+                      "managementUnitId": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "dayMetrics": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "date": {
+                          "type": "string"
+                        },
+                        "adherencePercent": {
+                          "type": "number"
+                        },
+                        "conformancePercent": {
+                          "type": "number"
+                        },
+                        "exceptionDurationMinutes": {
+                          "type": "number"
+                        },
+                        "outOfAdherenceDurationMinutes": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "user",
+                  "dayMetrics"
+                ]
+              }
+            }
+          }
+        },
+        "ForEach_User": {
+          "type": "Foreach",
+          "runAfter": {
+            "Parse_Result_Array": [
+              "Succeeded"
+            ]
+          },
+          "foreach": "@{body('Parse_Result_Array')}",
+          "actions": {
+            "ForEach_DayMetric": {
+              "type": "Foreach",
+              "foreach": "@{coalesce(item()?['dayMetrics'], array())}",
+              "actions": {
+                "Add_Row_to_Excel": {
+                  "type": "ApiConnection",
+                  "inputs": {
+                    "host": {
+                      "connection": {
+                        "name": "@parameters('$connections')['shared_excelonlinebusiness']['connectionId']"
+                      }
+                    },
+                    "method": "post",
+                    "path": "/v2/datasets/@{encodeURIComponent(parameters('ExcelFileId'))}/tables/@{encodeURIComponent(parameters('ExcelTableName'))}/items",
+                    "body": {
+                      "item": {
+                        "userId": "@{coalesce(item()?['user']?['id'],'')}",
+                        "userName": "@{coalesce(item()?['user']?['name'],'')}",
+                        "teamName": "@{coalesce(item()?['user']?['team'],'\u2014')}",
+                        "muId": "@{coalesce(item()?['user']?['managementUnitId'],'')}",
+                        "date": "@{coalesce(items('ForEach_DayMetric')?['date'],'')}",
+                        "adherencePercent": "@{coalesce(items('ForEach_DayMetric')?['adherencePercent'], 0)}",
+                        "conformancePercent": "@{coalesce(items('ForEach_DayMetric')?['conformancePercent'], 0)}",
+                        "exceptionDurationMinutes": "@{coalesce(items('ForEach_DayMetric')?['exceptionDurationMinutes'], 0)}",
+                        "outOfAdherenceDurationMinutes": "@{coalesce(items('ForEach_DayMetric')?['outOfAdherenceDurationMinutes'], 0)}"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "outputs": {}
+}
