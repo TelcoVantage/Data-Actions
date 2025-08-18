@@ -1,89 +1,225 @@
-@if(
-  startsWith(body('Parse_Start')?['selfUri'], 'http'),
-  body('Parse_Start')?['selfUri'],
-  concat('https://api.mypurecloud.com.au', body('Parse_Start')?['selfUri'])
-)
+Of course. Here is a detailed, step-by-step guide from start to finish. I'll include the names for each action, the code you need to paste, and exactly which dynamic content to select.
 
+📋 Prerequisites
+Genesys Cloud OAuth Client: You need a Client ID and a Client Secret. Make sure it has the wfm:historicaladherence:view permission.
 
+Management Unit ID: Have the ID of the Management Unit you want to query ready.
 
+Excel File: Create an Excel file in OneDrive or SharePoint. Inside that file, create a worksheet and format a range of cells as a table (Insert > Table). Give the table a name (e.g., AdherenceData). Create column headers like UserName, UserEmail, AdherencePercentage, etc., that match the data you want to capture.
 
+⚙️ Step-by-Step Power Automate Flow
+Stage 1: Get an Access Token
+Trigger: Start with a "Manually trigger a flow" button.
 
-jobId=@{body('Parse_Start')?['jobId']},
-selfUri=@{body('Parse_Start')?['selfUri']},
-statusUrl=@{outputs('StatusURL')}
+Action: HTTP - Get Access Token
 
+Click "+ New step" and search for the "HTTP" action.
 
+Action Name: Rename it to HTTP - Get Access Token.
 
+Method: POST
 
-{
-  "type": "object",
-  "properties": {
-    "state": { "type": "string" },
-    "errorMessage": { "type": "string" },
-    "downloadUrls": {
-      "type": "array",
-      "items": { "type": "string" }
-    }
-  },
-  "required": ["state"]
-}
-
-
-
-
-{
-  "type": "array",
-  "items": {
-    "type": "object",
-    "properties": {
-      "user": {
-        "type": "object",
-        "properties": {
-          "id": { "type": "string" },
-          "name": { "type": "string" },
-          "team": { "type": "string" },
-          "managementUnitId": { "type": "string" }
-        }
-      },
-      "dayMetrics": {
-        "type": "array",
-        "items": {
-          "type": "object",
-          "properties": {
-            "date": { "type": "string" },
-            "adherencePercent": { "type": "number" },
-            "conformancePercent": { "type": "number" },
-            "exceptionDurationMinutes": { "type": "number" },
-            "outOfAdherenceDurationMinutes": { "type": "number" }
-          }
-        }
-      }
-    },
-    "required": ["user","dayMetrics"]
-  }
-}
-4) Poll until the job completes (using StatusURL)
-
-Action: Do until — Until_Complete
-
-Condition: @equals(body('Parse_Job')?['state'], 'Complete')
-
-Change limits: Timeout = PT15M, Delay between iterations = 15 seconds
-
-Inside Until_Complete:
-
-HTTP — HTTP_Get_Job
-
-Method: GET
-
-URI: @{outputs('StatusURL')}
+URI: https://login.mypurecloud.com.au/oauth/token (Ensure you use .com.au for the Sydney region)
 
 Headers:
 
-Authorization: @{concat('Bearer ', body('Parse_Token')?['access_token'])}
+Content-Type: application/x-www-form-urlencoded
 
-Parse JSON — Parse_Job
+Body:
 
-Content: Body of HTTP_Get_Job
+grant_type=client_credentials&client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET
+(Replace YOUR_CLIENT_ID and YOUR_CLIENT_SECRET with your actual credentials)
 
-Schema:
+Action: Parse JSON - Access Token
+
+Action Name: Rename it to Parse JSON - Access Token.
+
+Content: In the dynamic content box, select Body from the HTTP - Get Access Token step.
+
+Schema: Click "Generate from sample" and paste the following:
+
+JSON
+
+{
+    "access_token": "your-token",
+    "token_type": "bearer",
+    "expires_in": 86399
+}
+Stage 2: Start the Adherence Report Job
+Action: HTTP - Start Adherence Job
+
+Action Name: Rename it to HTTP - Start Adherence Job.
+
+Method: POST
+
+URI: https://api.mypurecloud.com.au/api/v2/workforcemanagement/adherence/historical/bulk
+
+Headers:
+
+Content-Type: application/json
+
+Authorization: In the value box, type Bearer  (with a space at the end), then select access_token from the Parse JSON - Access Token dynamic content.
+
+Body: This example gets the data for the previous day.
+
+JSON
+
+{
+  "items": [
+    {
+      "managementUnitId": "YOUR_MANAGEMENT_UNIT_ID",
+      "startDate": "@{formatDateTime(addDays(utcNow(), -1), 'yyyy-MM-ddT00:00:00.000Z')}",
+      "endDate": "@{formatDateTime(utcNow(), 'yyyy-MM-ddT00:00:00.000Z')}"
+    }
+  ],
+  "timeZone": "Australia/Sydney"
+}
+(Replace YOUR_MANAGEMENT_UNIT_ID with your actual ID)
+
+Action: Parse JSON - Job Response
+
+Action Name: Rename it to Parse JSON - Job Response.
+
+Content: Select Body from the HTTP - Start Adherence Job step.
+
+Schema: Click "Generate from sample" and paste the following:
+
+JSON
+
+{
+    "id": "job-id",
+    "state": "Processing"
+}
+Stage 3: The Polling Loop (Wait for the Job to Finish)
+Action: Initialize variable - jobStatus
+
+Search for and add the "Initialize variable" action.
+
+Name: jobStatus
+
+Type: String
+
+Value: Select state from the Parse JSON - Job Response dynamic content.
+
+Control: Do until - Job is Complete
+
+Search for and add the "Do until" control.
+
+Condition: Select the jobStatus variable from dynamic content, choose is equal to, and type Complete in the value box.
+
+Now, add all the following actions inside the "Do until" box.
+
+Action (inside loop): Delay
+
+Search for and add the "Delay" action.
+
+Count: 30
+
+Unit: Seconds
+
+Action (inside loop): HTTP - Check Job Status
+
+Action Name: Rename it to HTTP - Check Job Status.
+
+Method: GET
+
+URI: Type https://api.mypurecloud.com.au/api/v2/workforcemanagement/adherence/historical/bulk/jobs/, then select id from the Parse JSON - Job Response dynamic content.
+
+Headers:
+
+Authorization: Bearer  followed by the access_token from Parse JSON - Access Token.
+
+Action (inside loop): Parse JSON - Job Status
+
+Action Name: Rename it to Parse JSON - Job Status.
+
+Content: Select Body from the HTTP - Check Job Status step.
+
+Schema: Click "Generate from sample" and paste the following:
+
+JSON
+
+{
+    "id": "job-id",
+    "state": "Complete",
+    "downloadUrl": "https://your.download.url/here"
+}
+Action (inside loop): Set variable - jobStatus
+
+Search for and add the "Set variable" action.
+
+Name: jobStatus
+
+Value: Select state from the Parse JSON - Job Status dynamic content.
+
+Stage 4: Download and Process the Results into Excel
+These actions go after the "Do until" loop.
+
+Action: HTTP - Download Results
+
+Action Name: Rename it to HTTP - Download Results.
+
+Method: GET
+
+URI: Select downloadUrl from the Parse JSON - Job Status step (the one inside the loop).
+
+Important: Do not add any headers or authentication to this step. The URL is pre-signed.
+
+Action: Create file (OneDrive)
+
+Folder Path: Choose where you want to save the temporary ZIP file.
+
+File Name: adherence_report.zip
+
+File Content: Select Body from the HTTP - Download Results step.
+
+Action: Extract archive (OneDrive)
+
+Source File Path: Select the adherence_report.zip file you just created.
+
+Destination Folder Path: Choose a folder where the contents will be extracted.
+
+Action: Get file content (OneDrive)
+
+This gets the actual JSON data from the unzipped folder.
+
+File: Navigate to the destination folder from the previous step and find the file named adherence-report.json.
+
+Action: Parse JSON - Final Adherence Data
+
+Content: Select File Content from the previous "Get file content" step.
+
+Schema: The schema depends on all the fields you want. A simple one for key metrics is:
+
+JSON
+
+{
+    "type": "object",
+    "properties": {
+        "data": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "userName": { "type": "string" },
+                    "adherencePercentage": { "type": "number" },
+                    "userEmail": { "type": "string" }
+                },
+                "required": ["userName", "adherencePercentage", "userEmail"]
+            }
+        }
+    }
+}
+Control: Apply to each
+
+Select an output from previous steps: Select data from the Parse JSON - Final Adherence Data step.
+
+Inside this loop, add the final action:
+
+Action (inside loop): Add a row into a table (Excel)
+
+Location: Select the location of your Excel file (OneDrive, SharePoint).
+
+Document Library / File / Table: Select your file and the table you created in the prerequisites.
+
+Power Automate will show your table's columns. Map the dynamic content from the Parse JSON - Final Adherence Data step to the correct columns (e.g., userName from JSON goes to the UserName column in Excel).
