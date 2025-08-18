@@ -1,0 +1,15 @@
+{
+  "packageSchemaVersion": "1.0",
+  "name": "Genesys Historical Adherence \u2192 Excel (Prev Day, Sydney)",
+  "shortDescription": "Runs daily at 06:05 Sydney time. Starts Genesys historical adherence bulk job for previous day, polls, downloads results, appends to Excel table.",
+  "sourceEnvironment": "import",
+  "version": "1.0.0",
+  "creator": "ChatGPT",
+  "flows": [
+    {
+      "name": "GenesysHistoricalAdherenceToExcel",
+      "definition": "definition.json",
+      "connections": "connections.json"
+    }
+  ]
+}

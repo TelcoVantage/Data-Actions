@@ -1,0 +1,18 @@
+{
+  "managedApiConnections": {
+    "shared_excelonlinebusiness": {
+      "api": {
+        "name": "shared_excelonlinebusiness"
+      },
+      "connection": {
+        "id": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness"
+      },
+      "connectionRuntimeUrl": "https://europe-001.azure-apim.net/apim/excelonlinebusiness",
+      "authentication": {
+        "type": "Raw",
+        "scheme": "Key",
+        "parameter": "REPLACE_AT_IMPORT"
+      }
+    }
+  }
+}
