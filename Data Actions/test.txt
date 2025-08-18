@@ -1,3 +1,20 @@
+@if(
+  startsWith(body('Parse_Start')?['selfUri'], 'http'),
+  body('Parse_Start')?['selfUri'],
+  concat('https://api.mypurecloud.com.au', body('Parse_Start')?['selfUri'])
+)
+
+
+
+
+
+jobId=@{body('Parse_Start')?['jobId']},
+selfUri=@{body('Parse_Start')?['selfUri']},
+statusUrl=@{outputs('StatusURL')}
+
+
+
+
 {
   "type": "object",
   "properties": {
@@ -10,4 +27,38 @@
   },
   "required": ["state"]
 }
-Headers: Authorization: @{concat('Bearer ', body('Parse_Token')?['access_token'])}
+
+
+
+
+{
+  "type": "array",
+  "items": {
+    "type": "object",
+    "properties": {
+      "user": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "team": { "type": "string" },
+          "managementUnitId": { "type": "string" }
+        }
+      },
+      "dayMetrics": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "date": { "type": "string" },
+            "adherencePercent": { "type": "number" },
+            "conformancePercent": { "type": "number" },
+            "exceptionDurationMinutes": { "type": "number" },
+            "outOfAdherenceDurationMinutes": { "type": "number" }
+          }
+        }
+      }
+    },
+    "required": ["user","dayMetrics"]
+  }
+}
