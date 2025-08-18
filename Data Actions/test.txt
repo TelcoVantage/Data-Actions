@@ -1,5 +1,3 @@
-@if(
-  startsWith(body('Parse_Start')?['selfUri'], 'http'),
-  body('Parse_Start')?['selfUri'],
-  concat('https://api.mypurecloud.com.au', body('Parse_Start')?['selfUri'])
-)
+jobId=@{body('Parse_Start')?['jobId']},
+selfUri=@{body('Parse_Start')?['selfUri']},
+statusUrl=@{outputs('StatusURL')}
