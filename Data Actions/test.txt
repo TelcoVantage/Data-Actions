@@ -10,3 +10,4 @@
   },
   "required": ["state"]
 }
+Headers: Authorization: @{concat('Bearer ', body('Parse_Token')?['access_token'])}
