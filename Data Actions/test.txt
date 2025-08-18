@@ -62,3 +62,28 @@ statusUrl=@{outputs('StatusURL')}
     "required": ["user","dayMetrics"]
   }
 }
+4) Poll until the job completes (using StatusURL)
+
+Action: Do until — Until_Complete
+
+Condition: @equals(body('Parse_Job')?['state'], 'Complete')
+
+Change limits: Timeout = PT15M, Delay between iterations = 15 seconds
+
+Inside Until_Complete:
+
+HTTP — HTTP_Get_Job
+
+Method: GET
+
+URI: @{outputs('StatusURL')}
+
+Headers:
+
+Authorization: @{concat('Bearer ', body('Parse_Token')?['access_token'])}
+
+Parse JSON — Parse_Job
+
+Content: Body of HTTP_Get_Job
+
+Schema:
