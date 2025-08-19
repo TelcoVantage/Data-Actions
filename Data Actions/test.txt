@@ -1,67 +1,45 @@
 # =============================================================================
-# User Configuration - FINAL SCRIPT
+# User Configuration - Hardcoded Test
 # =============================================================================
 
-# Your Genesys Cloud OAuth Client ID
+# Use the Client ID and Secret for the final test.
 $clientId = "YOUR_CLIENT_ID_HERE"
-
-# Your Genesys Cloud OAuth Client Secret
 $clientSecret = "YOUR_CLIENT_SECRET_HERE"
-
-# Your Genesys Cloud region (e.g., "com", "com.au", "eu-west-1.pure.cloud")
 $genesysCloudRegion = "com.au"
 
-# The ID of the Management Unit you want to query
-$managementUnitId = "YOUR_MANAGEMENT_UNIT_ID_HERE"
+# --- PASTE YOUR KNOWN-GOOD VALUES HERE ---
+# Paste the Management Unit ID you verified in the UI.
+$managementUnitId = "ID_OF_MU_WITH_KNOWN_DATA" 
 
-# The timezone for the report query
+# Set the EXACT start and end date for the day you verified in the UI.
+# Example for August 18th, 2025.
+$startDate = "2025-08-18T00:00:00.000Z"
+$endDate = "2025-08-19T00:00:00.000Z"
 $timeZone = "Australia/Sydney"
-
-# --- Date Range Configuration ---
-$startDate = (Get-Date).AddDays(-1).Date.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-$endDate = (Get-Date).Date.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-
 # =============================================================================
-# Script Logic
+# Script Logic (No edits needed below)
 # =============================================================================
-
+# ... (The rest of the script is the same as the last version) ...
 $loginUrl = "https://login.mypurecloud.$($genesysCloudRegion)/oauth/token"
 $apiUrl = "https://api.mypurecloud.$($genesysCloudRegion)/api/v2/workforcemanagement/adherence/historical/bulk"
-
-Write-Host "Authenticating with Genesys Cloud..." -ForegroundColor Green
+Write-Host "Authenticating..."
 try {
     $authBody = @{ grant_type = "client_credentials"; client_id = $clientId; client_secret = $clientSecret }
     $tokenResponse = Invoke-RestMethod -Uri $loginUrl -Method Post -Body $authBody -ContentType 'application/x-www-form-urlencoded'
     $accessToken = $tokenResponse.access_token
-    Write-Host "Successfully obtained access token."
-}
-catch {
-    Write-Error "Failed to get access token. Error: $($_.Exception.Message)"
-    return
-}
-
-Write-Host "Submitting historical adherence job..." -ForegroundColor Green
+} catch { Write-Error "Auth failed: $($_.Exception.Message)"; return }
+Write-Host "Submitting job with hardcoded known-good data..."
 $headers = @{ "Authorization"  = "Bearer $($accessToken)"; "Content-Type"   = "application/json" }
-$jobRequestBodyObject = @{
-    items = @( @{ managementUnitId = $managementUnitId; startDate = $startDate; endDate = $endDate } )
-    timeZone = $timeZone
-}
+$jobRequestBodyObject = @{ items = @( @{ managementUnitId = $managementUnitId; startDate = $startDate; endDate = $endDate } ); timeZone = $timeZone }
 $jsonBody = $jobRequestBodyObject | ConvertTo-Json
-
 try {
     $jobResponse = Invoke-RestMethod -Uri $apiUrl -Method Post -Headers $headers -Body $jsonBody
-    
     Write-Host "`n✅ Job successfully submitted!" -ForegroundColor Green
     Write-Host "--------------------------------"
-    # --- CORRECTED LINES ---
     Write-Host "Job ID: $($jobResponse.job.id)" -ForegroundColor Cyan
     Write-Host "Status: $($jobResponse.job.status)"
-    # --- END CORRECTIONS ---
     Write-Host "--------------------------------"
-    Write-Host "`nUse the Job ID above to check the status and download the report."
-
-}
-catch {
+} catch {
     $errorResponse = $_.Exception.Response
     $statusCode = [int]$errorResponse.StatusCode
     $streamReader = New-Object System.IO.StreamReader($errorResponse.GetResponseStream())
