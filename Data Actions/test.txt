@@ -1,286 +1,31 @@
-Of course. Here is a detailed, step-by-step guide from start to finish. I'll include the names for each action, the code you need to paste, and exactly which dynamic content to select.
-
-📋 Prerequisites
-Genesys Cloud OAuth Client: You need a Client ID and a Client Secret. Make sure it has the wfm:historicaladherence:view permission.
-
-Management Unit ID: Have the ID of the Management Unit you want to query ready.
-
-Excel File: Create an Excel file in OneDrive or SharePoint. Inside that file, create a worksheet and format a range of cells as a table (Insert > Table). Give the table a name (e.g., AdherenceData). Create column headers like UserName, UserEmail, AdherencePercentage, etc., that match the data you want to capture.
-
-⚙️ Step-by-Step Power Automate Flow
-Stage 1: Get an Access Token
-Trigger: Start with a "Manually trigger a flow" button.
-
-Action: HTTP - Get Access Token
-
-Click "+ New step" and search for the "HTTP" action.
-
-Action Name: Rename it to HTTP - Get Access Token.
-
-Method: POST
-
-URI: https://login.mypurecloud.com.au/oauth/token (Ensure you use .com.au for the Sydney region)
-
-Headers:
-
-Content-Type: application/x-www-form-urlencoded
-
-Body:
-
-grant_type=client_credentials&client_id=YOUR_CLIENT_ID&client_secret=YOUR_CLIENT_SECRET
-(Replace YOUR_CLIENT_ID and YOUR_CLIENT_SECRET with your actual credentials)
-
-Action: Parse JSON - Access Token
-
-Action Name: Rename it to Parse JSON - Access Token.
-
-Content: In the dynamic content box, select Body from the HTTP - Get Access Token step.
-
-Schema: Click "Generate from sample" and paste the following:
-
-JSON
-
-{
-    "access_token": "your-token",
-    "token_type": "bearer",
-    "expires_in": 86399
-}
-Stage 2: Start the Adherence Report Job
-Action: HTTP - Start Adherence Job
-
-Action Name: Rename it to HTTP - Start Adherence Job.
-
-Method: POST
-
-URI: https://api.mypurecloud.com.au/api/v2/workforcemanagement/adherence/historical/bulk
-
-Headers:
-
-Content-Type: application/json
-
-Authorization: In the value box, type Bearer  (with a space at the end), then select access_token from the Parse JSON - Access Token dynamic content.
-
-Body: This example gets the data for the previous day.
-
-JSON
-
-{
-  "items": [
-    {
-      "managementUnitId": "YOUR_MANAGEMENT_UNIT_ID",
-      "startDate": "@{formatDateTime(addDays(utcNow(), -1), 'yyyy-MM-ddT00:00:00.000Z')}",
-      "endDate": "@{formatDateTime(utcNow(), 'yyyy-MM-ddT00:00:00.000Z')}"
-    }
-  ],
-  "timeZone": "Australia/Sydney"
-}
-(Replace YOUR_MANAGEMENT_UNIT_ID with your actual ID)
-
-Action: Parse JSON - Job Response
-
-Action Name: Rename it to Parse JSON - Job Response.
-
-Content: Select Body from the HTTP - Start Adherence Job step.
-
-Schema: Click "Generate from sample" and paste the following:
-
-JSON
-
-{
-    "id": "job-id",
-    "state": "Processing"
-}
-Stage 3: The Polling Loop (Wait for the Job to Finish)
-Action: Initialize variable - jobStatus
-
-Search for and add the "Initialize variable" action.
-
-Name: jobStatus
-
-Type: String
-
-Value: Select state from the Parse JSON - Job Response dynamic content.
-
-Control: Do until - Job is Complete
-
-Search for and add the "Do until" control.
-
-Condition: Select the jobStatus variable from dynamic content, choose is equal to, and type Complete in the value box.
-
-Now, add all the following actions inside the "Do until" box.
-
-Action (inside loop): Delay
-
-Search for and add the "Delay" action.
-
-Count: 30
-
-Unit: Seconds
-
-Action (inside loop): HTTP - Check Job Status
-
-Action Name: Rename it to HTTP - Check Job Status.
-
-Method: GET
-
-URI: Type https://api.mypurecloud.com.au/api/v2/workforcemanagement/adherence/historical/bulk/jobs/, then select id from the Parse JSON - Job Response dynamic content.
-
-Headers:
-
-Authorization: Bearer  followed by the access_token from Parse JSON - Access Token.
-
-Action (inside loop): Parse JSON - Job Status
-
-Action Name: Rename it to Parse JSON - Job Status.
-
-Content: Select Body from the HTTP - Check Job Status step.
-
-Schema: Click "Generate from sample" and paste the following:
-
-JSON
-
-{
-    "id": "job-id",
-    "state": "Complete",
-    "downloadUrl": "https://your.download.url/here"
-}
-Action (inside loop): Set variable - jobStatus
-
-Search for and add the "Set variable" action.
-
-Name: jobStatus
-
-Value: Select state from the Parse JSON - Job Status dynamic content.
-
-Stage 4: Download and Process the Results into Excel
-These actions go after the "Do until" loop.
-
-Action: HTTP - Download Results
-
-Action Name: Rename it to HTTP - Download Results.
-
-Method: GET
-
-URI: Select downloadUrl from the Parse JSON - Job Status step (the one inside the loop).
-
-Important: Do not add any headers or authentication to this step. The URL is pre-signed.
-
-Action: Create file (OneDrive)
-
-Folder Path: Choose where you want to save the temporary ZIP file.
-
-File Name: adherence_report.zip
-
-File Content: Select Body from the HTTP - Download Results step.
-
-Action: Extract archive (OneDrive)
-
-Source File Path: Select the adherence_report.zip file you just created.
-
-Destination Folder Path: Choose a folder where the contents will be extracted.
-
-Action: Get file content (OneDrive)
-
-This gets the actual JSON data from the unzipped folder.
-
-File: Navigate to the destination folder from the previous step and find the file named adherence-report.json.
-
-Action: Parse JSON - Final Adherence Data
-
-Content: Select File Content from the previous "Get file content" step.
-
-Schema: The schema depends on all the fields you want. A simple one for key metrics is:
-
-JSON
-
-{
-    "type": "object",
-    "properties": {
-        "data": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "userName": { "type": "string" },
-                    "adherencePercentage": { "type": "number" },
-                    "userEmail": { "type": "string" }
-                },
-                "required": ["userName", "adherencePercentage", "userEmail"]
-            }
-        }
-    }
-}
-Control: Apply to each
-
-Select an output from previous steps: Select data from the Parse JSON - Final Adherence Data step.
-
-Inside this loop, add the final action:
-
-Action (inside loop): Add a row into a table (Excel)
-
-Location: Select the location of your Excel file (OneDrive, SharePoint).
-
-Document Library / File / Table: Select your file and the table you created in the prerequisites.
-
-Power Automate will show your table's columns. Map the dynamic content from the Parse JSON - Final Adherence Data step to the correct columns (e.g., userName from JSON goes to the UserName column in Excel).
-
-
-
-
-
-
 <# 
 .SYNOPSIS
-  Start a Genesys Cloud WFM Historical Adherence (bulk) job and (optionally) poll status.
+  Start a Genesys Cloud WFM Historical Adherence (bulk) job using a pre-issued access token.
 
 .EXAMPLE
   .\Start-GC-HistoricalAdherenceBulk.ps1 `
-    -ClientId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
-    -ClientSecret 'YOUR_SECRET' `
+    -AccessToken 'eyJhbGciOiJ...' `
     -ManagementUnitId 'YOUR_MU_ID' `
     -StartDate '2025-08-11' `
     -EndDate '2025-08-15' `
     -Poll
-
-.NOTES
-  Region defaults to AU (mypurecloud.com.au). Change -RegionBase/-AuthBase if needed.
 #>
 
 param(
-  [Parameter(Mandatory=$true)] [string] $ClientId,
-  [Parameter(Mandatory=$true)] [string] $ClientSecret,
+  [Parameter(Mandatory=$true)] [string] $AccessToken,
   [Parameter(Mandatory=$true)] [string] $ManagementUnitId,
+  [Parameter(Mandatory=$true)] [string] $StartDate,  # YYYY-MM-DD
+  [Parameter(Mandatory=$true)] [string] $EndDate,    # YYYY-MM-DD
 
-  # Dates as YYYY-MM-DD (date-only is safest; avoids TZ edge cases)
-  [Parameter(Mandatory=$true)] [ValidatePattern('^\d{4}-\d{2}-\d{2}$')] [string] $StartDate,
-  [Parameter(Mandatory=$true)] [ValidatePattern('^\d{4}-\d{2}-\d{2}$')] [string] $EndDate,
-
-  # Region endpoints (AU by default)
   [string] $RegionBase = "https://api.mypurecloud.com.au",
-  [string] $AuthBase   = "https://login.mypurecloud.com.au",
+  [string] $TimeZone   = "Australia/Sydney",
 
-  # Sydney IANA tz for the payload
-  [string] $TimeZone = "Australia/Sydney",
-
-  # Polling controls
   [switch] $Poll,
   [int] $PollIntervalSeconds = 15,
   [int] $PollTimeoutMinutes  = 15
 )
 
 $ErrorActionPreference = 'Stop'
-
-function Get-GenesysToken {
-  param([string]$AuthBase,[string]$ClientId,[string]$ClientSecret)
-
-  $tokenUri = "$AuthBase/oauth/token"
-  $body = "grant_type=client_credentials&client_id=$($ClientId)&client_secret=$($ClientSecret)"
-  $headers = @{ "Content-Type" = "application/x-www-form-urlencoded" }
-
-  $resp = Invoke-RestMethod -Method POST -Uri $tokenUri -Headers $headers -Body $body
-  if (-not $resp.access_token) { throw "No access_token in OAuth response." }
-  return $resp.access_token
-}
 
 function Start-HistoricalAdherenceBulk {
   param(
@@ -291,7 +36,6 @@ function Start-HistoricalAdherenceBulk {
   $uri = "$RegionBase/api/v2/workforcemanagement/adherence/historical/bulk"
   $headers = @{ "Authorization" = "Bearer $AccessToken"; "Content-Type" = "application/json" }
 
-  # Using the 'items' shape (date-only; safest)
   $payload = @{
     items   = @(@{
       managementUnitId = $ManagementUnitId
@@ -301,61 +45,42 @@ function Start-HistoricalAdherenceBulk {
     timeZone = $TimeZone
   } | ConvertTo-Json -Depth 6
 
-  $resp = Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $payload
-  if (-not $resp.jobId) { throw "POST did not return a jobId. Raw: $( $resp | ConvertTo-Json -Depth 10 )" }
-
-  return $resp
+  return Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $payload
 }
 
 function Get-BulkJobStatus {
   param([string]$StatusUrl,[string]$AccessToken)
-
   $headers = @{ "Authorization" = "Bearer $AccessToken" }
-  $resp = Invoke-RestMethod -Method GET -Uri $StatusUrl -Headers $headers
-  return $resp
+  return Invoke-RestMethod -Method GET -Uri $StatusUrl -Headers $headers
 }
 
 try {
-  Write-Host "Obtaining OAuth token..." -ForegroundColor Cyan
-  $token = Get-GenesysToken -AuthBase $AuthBase -ClientId $ClientId -ClientSecret $ClientSecret
-
   Write-Host "Starting Historical Adherence bulk job..." -ForegroundColor Cyan
-  $startResp = Start-HistoricalAdherenceBulk -RegionBase $RegionBase -AccessToken $token `
+  $startResp = Start-HistoricalAdherenceBulk -RegionBase $RegionBase -AccessToken $AccessToken `
               -ManagementUnitId $ManagementUnitId -StartDate $StartDate -EndDate $EndDate -TimeZone $TimeZone
 
   $jobId   = $startResp.jobId
   $selfUri = $startResp.selfUri
-
-  # Build absolute status URL from selfUri (covers relative or absolute)
-  if ($selfUri -match '^https?://') {
-    $statusUrl = $selfUri
-  } else {
-    $statusUrl = "$RegionBase$selfUri"
-  }
+  $statusUrl = if ($selfUri -match '^https?://') { $selfUri } else { "$RegionBase$selfUri" }
 
   Write-Host ""
   Write-Host "Job started." -ForegroundColor Green
   Write-Host ("jobId    : {0}" -f $jobId)
-  Write-Host ("selfUri  : {0}" -f $selfUri)
   Write-Host ("statusUrl: {0}" -f $statusUrl)
-  if ($startResp.state) { Write-Host ("state    : {0}" -f $startResp.state) }
+  Write-Host ("state    : {0}" -f $startResp.state)
 
-  if (-not $Poll) {
-    Write-Host "`nTip: To poll, re-run this script with -Poll." -ForegroundColor Yellow
-    return
-  }
+  if (-not $Poll) { return }
 
-  Write-Host "`nPolling job status (every $PollIntervalSeconds s, up to $PollTimeoutMinutes min)..." -ForegroundColor Cyan
-
+  Write-Host "`nPolling until Complete..." -ForegroundColor Cyan
   $deadline = (Get-Date).AddMinutes($PollTimeoutMinutes)
   $lastState = $null
 
-  Start-Sleep -Seconds 2  # tiny grace period to avoid transient 404s
+  Start-Sleep -Seconds 2
+
   do {
     try {
-      $status = Get-BulkJobStatus -StatusUrl $statusUrl -AccessToken $token
+      $status = Get-BulkJobStatus -StatusUrl $statusUrl -AccessToken $AccessToken
     } catch {
-      # transient 404s right after creation; wait and retry
       Write-Host "Transient error while polling: $($_.Exception.Message)" -ForegroundColor DarkYellow
       Start-Sleep -Seconds $PollIntervalSeconds
       continue
@@ -388,12 +113,9 @@ try {
     Write-Host "downloadUrls:" -ForegroundColor Green
     $status.downloadUrls | ForEach-Object { Write-Host "  $_" }
   } else {
-    Write-Host "No downloadUrls returned (empty result set for given dates/users)." -ForegroundColor Yellow
+    Write-Host "No downloadUrls returned (empty result set)." -ForegroundColor Yellow
   }
 
 } catch {
   Write-Error $_.Exception.Message
-  if ($_.ErrorDetails) { Write-Host ($_.ErrorDetails | Out-String) }
-  exit 1
 }
-
