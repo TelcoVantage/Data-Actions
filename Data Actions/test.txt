@@ -1,41 +1,65 @@
 # =============================================================================
-# User Configuration
+# User Configuration - FINAL SCRIPT
 # =============================================================================
-$manualAccessToken = "PASTE_YOUR_COPIED_TOKEN_HERE"
+
+# Your Genesys Cloud OAuth Client ID
+$clientId = "YOUR_CLIENT_ID_HERE"
+
+# Your Genesys Cloud OAuth Client Secret
+$clientSecret = "YOUR_CLIENT_SECRET_HERE"
+
+# Your Genesys Cloud region (e.g., "com", "com.au", "eu-west-1.pure.cloud")
 $genesysCloudRegion = "com.au"
+
+# The ID of the Management Unit you want to query
 $managementUnitId = "YOUR_MANAGEMENT_UNIT_ID_HERE"
+
+# The timezone for the report query
 $timeZone = "Australia/Sydney"
+
+# --- Date Range Configuration ---
 $startDate = (Get-Date).AddDays(-1).Date.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 $endDate = (Get-Date).Date.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 
 # =============================================================================
 # Script Logic
 # =============================================================================
-Write-Host "Milestone 1: Script started, variables loaded." -ForegroundColor Yellow
+
+$loginUrl = "https://login.mypurecloud.$($genesysCloudRegion)/oauth/token"
 $apiUrl = "https://api.mypurecloud.$($genesysCloudRegion)/api/v2/workforcemanagement/adherence/historical/bulk"
-Write-Host "Submitting historical adherence job using manual user token..." -ForegroundColor Green
-$headers = @{ "Authorization"  = "Bearer $($manualAccessToken)"; "Content-Type"   = "application/json" }
+
+Write-Host "Authenticating with Genesys Cloud..." -ForegroundColor Green
+try {
+    $authBody = @{ grant_type = "client_credentials"; client_id = $clientId; client_secret = $clientSecret }
+    $tokenResponse = Invoke-RestMethod -Uri $loginUrl -Method Post -Body $authBody -ContentType 'application/x-www-form-urlencoded'
+    $accessToken = $tokenResponse.access_token
+    Write-Host "Successfully obtained access token."
+}
+catch {
+    Write-Error "Failed to get access token. Error: $($_.Exception.Message)"
+    return
+}
+
+Write-Host "Submitting historical adherence job..." -ForegroundColor Green
+$headers = @{ "Authorization"  = "Bearer $($accessToken)"; "Content-Type"   = "application/json" }
 $jobRequestBodyObject = @{
     items = @( @{ managementUnitId = $managementUnitId; startDate = $startDate; endDate = $endDate } )
     timeZone = $timeZone
 }
 $jsonBody = $jobRequestBodyObject | ConvertTo-Json
-Write-Host "Milestone 2: Entering API call block." -ForegroundColor Yellow
 
 try {
     $jobResponse = Invoke-RestMethod -Uri $apiUrl -Method Post -Headers $headers -Body $jsonBody
     
-    # --- NEW DEBUGGING BLOCK ---
-    Write-Host "`n--- RAW API Response ---" -ForegroundColor Magenta
-    Write-Host ($jobResponse | ConvertTo-Json -Depth 5)
-    Write-Host "--- End RAW Response ---`n" -ForegroundColor Magenta
-    # --- END DEBUGGING BLOCK ---
-    
     Write-Host "`n✅ Job successfully submitted!" -ForegroundColor Green
     Write-Host "--------------------------------"
-    Write-Host "Job ID: $($jobResponse.id)" -ForegroundColor Cyan
-    Write-Host "Status: $($jobResponse.state)"
+    # --- CORRECTED LINES ---
+    Write-Host "Job ID: $($jobResponse.job.id)" -ForegroundColor Cyan
+    Write-Host "Status: $($jobResponse.job.status)"
+    # --- END CORRECTIONS ---
     Write-Host "--------------------------------"
+    Write-Host "`nUse the Job ID above to check the status and download the report."
+
 }
 catch {
     $errorResponse = $_.Exception.Response
@@ -45,5 +69,3 @@ catch {
     Write-Error "🔴 Failed to submit job. HTTP Status Code: $statusCode"
     Write-Error "API Error Response: $errorBody"
 }
-
-Write-Host "Milestone 3: Script finished." -ForegroundColor Yellow
