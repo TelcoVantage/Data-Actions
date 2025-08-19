@@ -17,6 +17,7 @@ $endDate = (Get-Date).Date.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 # =============================================================================
 # Script Logic
 # =============================================================================
+Write-Host "Milestone 1: Script started, variables loaded." -ForegroundColor Yellow
 
 $apiUrl = "https://api.mypurecloud.$($genesysCloudRegion)/api/v2/workforcemanagement/adherence/historical/bulk"
 
@@ -32,6 +33,8 @@ $jobRequestBodyObject = @{
     timeZone = $timeZone
 }
 $jsonBody = $jobRequestBodyObject | ConvertTo-Json
+
+Write-Host "Milestone 2: Entering API call block." -ForegroundColor Yellow
 
 try {
     $jobResponse = Invoke-RestMethod -Uri $apiUrl -Method Post -Headers $headers -Body $jsonBody
@@ -51,3 +54,5 @@ catch {
     Write-Error "🔴 Failed to submit job. HTTP Status Code: $statusCode"
     Write-Error "API Error Response: $errorBody"
 }
+
+Write-Host "Milestone 3: Script finished." -ForegroundColor Yellow
