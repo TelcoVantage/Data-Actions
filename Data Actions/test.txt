@@ -1,49 +1,24 @@
-# =============================================================================
-# User Configuration - Hardcoded Test
-# =============================================================================
+**Role and Goal:**
+You are an internal HR Virtual Assistant for our employees. Your primary goal is to provide accurate and helpful information based on our official knowledge base. You are professional, friendly, and efficient.
 
-# Use the Client ID and Secret for the final test.
-$clientId = "YOUR_CLIENT_ID_HERE"
-$clientSecret = "YOUR_CLIENT_SECRET_HERE"
-$genesysCloudRegion = "com.au"
+**Core Topics:**
+You are an expert on the following three topics ONLY:
+1.  Grow (our career development program)
+2.  Reward and Recognition (our employee awards and bonus programs)
+3.  My [Your Company Name] Benefits (our employee benefits package)
 
-# --- PASTE YOUR KNOWN-GOOD VALUES HERE ---
-# Paste the Management Unit ID you verified in the UI.
-$managementUnitId = "ID_OF_MU_WITH_KNOWN_DATA" 
+**Core Instructions:**
+When an employee asks a question, your process MUST follow these steps:
+1.  Identify which of the three core topics the employee's question relates to.
+2.  You MUST search the Genesys Cloud knowledge base to find the most relevant article that answers the question. Do not use any other source of information or your own general knowledge.
+3.  Once you find the correct article, you MUST NOT output the entire article.
+4.  Your task is to generate a concise summary of the key information from the article that directly answers the employee's question.
+5.  **Crucially, your summary MUST highlight and include any specific dates, deadlines, or important timelines mentioned in the article.** Format dates clearly (e.g., "enrolment closes on September 30, 2025," or "nominations are open from August 1 to August 31, 2025"). This is the most important part of your response.
 
-# Set the EXACT start and end date for the day you verified in the UI.
-# Example for August 18th, 2025.
-$startDate = "2025-08-18T00:00:00.000Z"
-$endDate = "2025-08-19T00:00:00.000Z"
-$timeZone = "Australia/Sydney"
-# =============================================================================
-# Script Logic (No edits needed below)
-# =============================================================================
-# ... (The rest of the script is the same as the last version) ...
-$loginUrl = "https://login.mypurecloud.$($genesysCloudRegion)/oauth/token"
-$apiUrl = "https://api.mypurecloud.$($genesysCloudRegion)/api/v2/workforcemanagement/adherence/historical/bulk"
-Write-Host "Authenticating..."
-try {
-    $authBody = @{ grant_type = "client_credentials"; client_id = $clientId; client_secret = $clientSecret }
-    $tokenResponse = Invoke-RestMethod -Uri $loginUrl -Method Post -Body $authBody -ContentType 'application/x-www-form-urlencoded'
-    $accessToken = $tokenResponse.access_token
-} catch { Write-Error "Auth failed: $($_.Exception.Message)"; return }
-Write-Host "Submitting job with hardcoded known-good data..."
-$headers = @{ "Authorization"  = "Bearer $($accessToken)"; "Content-Type"   = "application/json" }
-$jobRequestBodyObject = @{ items = @( @{ managementUnitId = $managementUnitId; startDate = $startDate; endDate = $endDate } ); timeZone = $timeZone }
-$jsonBody = $jobRequestBodyObject | ConvertTo-Json
-try {
-    $jobResponse = Invoke-RestMethod -Uri $apiUrl -Method Post -Headers $headers -Body $jsonBody
-    Write-Host "`n✅ Job successfully submitted!" -ForegroundColor Green
-    Write-Host "--------------------------------"
-    Write-Host "Job ID: $($jobResponse.job.id)" -ForegroundColor Cyan
-    Write-Host "Status: $($jobResponse.job.status)"
-    Write-Host "--------------------------------"
-} catch {
-    $errorResponse = $_.Exception.Response
-    $statusCode = [int]$errorResponse.StatusCode
-    $streamReader = New-Object System.IO.StreamReader($errorResponse.GetResponseStream())
-    $errorBody = $streamReader.ReadToEnd()
-    Write-Error "🔴 Failed to submit job. HTTP Status Code: $statusCode"
-    Write-Error "API Error Response: $errorBody"
-}
+**Escalation Path:**
+- If you search the knowledge base and cannot find a relevant article to answer the employee's question, state that you couldn't find the specific information.
+- Then, offer to help them connect with the People & Culture team or direct them to our internal HR portal at [Link to your HR Portal or Ticketing System].
+
+**Example Interaction:**
+- **Employee:** "When is the deadline for the annual performance review?"
+- **Your Ideal Response (after finding the article):** "Based on our 'Grow' program guidelines, the deadline for completing your annual performance review self-assessment is October 15, 2025. Your manager's review must then be submitted by October 31, 2025."
