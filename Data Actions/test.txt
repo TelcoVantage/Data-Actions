@@ -1,36 +1,35 @@
 <# 
 Start-GenesysHistoricalAdherenceBulk.ps1
-- All values hard-coded here (no parameters)
+- All values hard-coded in CONFIG
 - Starts WFM Historical Adherence (bulk), polls to completion,
   downloads results, and writes a flattened CSV.
+- Extra debug prints to diagnose "no jobId in response".
 #>
 
 # =======================
 # ======= CONFIG ========
 # =======================
-# --- REQUIRED: fill these in ---
-$AccessToken       = 'PASTE_YOUR_ACCESS_TOKEN_HERE'   # Bearer token (valid & not expired)
+$AccessToken       = 'PASTE_YOUR_ACCESS_TOKEN_HERE'   # Bearer token (valid)
+$RegionBase        = 'https://api.mypurecloud.com.au' # AU region
 $ManagementUnitId  = 'YOUR_MU_ID'                     # e.g. '16083220-1ec5-4868-863c-d78af2a65287'
-$StartDate         = '2025-08-18'                     # YYYY-MM-DD (Sydney calendar date)
-$EndDate           = '2025-08-18'                     # YYYY-MM-DD (inclusive)
-# --- Optional (usually fine as-is) ---
-$RegionBase        = 'https://api.mypurecloud.com.au' # AU region API base
-$TimeZone          = 'Australia/Sydney'               # IANA timezone for payload
-$OutFolder         = "$PWD\Adherence_Output"          # Output folder
+$StartDate         = '2025-08-18'                     # YYYY-MM-DD (Sydney calendar)
+$EndDate           = '2025-08-18'                     # YYYY-MM-DD
+$TimeZone          = 'Australia/Sydney'               # IANA timezone
+
+# Output
+$OutFolder           = "$PWD\Adherence_Output"
 $PollIntervalSeconds = 15
 $PollTimeoutMinutes  = 15
-
-# Filenames (timestamped)
-$stamp        = Get-Date -Format 'yyyyMMdd_HHmmss'
-$RunPrefix    = "adh_$($StartDate)_$($EndDate)_$stamp"
-$LogFile      = Join-Path $OutFolder "$RunPrefix.log"
-$FlatCsvFile  = Join-Path $OutFolder "$RunPrefix.flat.csv"
 
 # =======================
 # ====== SCRIPT =========
 # =======================
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path $OutFolder)) { New-Item -ItemType Directory -Path $OutFolder | Out-Null }
+$stamp        = Get-Date -Format 'yyyyMMdd_HHmmss'
+$RunPrefix    = "adh_$($StartDate)_$($EndDate)_$stamp"
+$LogFile      = Join-Path $OutFolder "$RunPrefix.log"
+$FlatCsvFile  = Join-Path $OutFolder "$RunPrefix.flat.csv"
 
 function Write-Log($msg, [ConsoleColor]$color = [ConsoleColor]::Gray) {
   $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
@@ -43,40 +42,67 @@ function Invoke-Genesys {
   param(
     [ValidateSet('GET','POST')] [string]$Method,
     [Parameter(Mandatory)] [string]$Uri,
-    [hashtable]$BodyObj = $null
+    [string]$RawJsonBody = $null
   )
   $headers = @{ "Authorization" = "Bearer $AccessToken" }
   if ($Method -eq 'POST') {
     $headers['Content-Type'] = 'application/json'
-    $body = if ($BodyObj) { ($BodyObj | ConvertTo-Json -Depth 10) } else { '{}' }
-    return Invoke-RestMethod -Method POST -Uri $Uri -Headers $headers -Body $body
+    return Invoke-RestMethod -Method POST -Uri $Uri -Headers $headers -Body $RawJsonBody
   } else {
     return Invoke-RestMethod -Method GET -Uri $Uri -Headers $headers
   }
 }
 
-# 1) Start Bulk Job (items shape; date-only avoids TZ edges)
-Write-Log "Starting Historical Adherence bulk job..." ([ConsoleColor]::Cyan)
-$startUri = "$RegionBase/api/v2/workforcemanagement/adherence/historical/bulk"
-$payload = @{
-  items   = @(@{
-    managementUnitId = $ManagementUnitId
-    startDate        = $StartDate
-    endDate          = $EndDate
-  })
-  timeZone = $TimeZone
-}
+# ---- Debug: who am I & MU visibility ----
+try {
+  Write-Log "DEBUG: GET /api/v2/tokens/me" ([ConsoleColor]::DarkCyan)
+  $who = Invoke-Genesys -Method GET -Uri "$RegionBase/api/v2/tokens/me"
+  $orgName = $who.organization.name
+  $homeRegion = $who.homeRegion
+  Write-Log "Identity: oauth-client in org '$orgName', homeRegion '$homeRegion'"
+} catch { Write-Log "DEBUG tokens/me failed: $($_.Exception.Message)" ([ConsoleColor]::DarkYellow) }
 
 try {
-  $startResp = Invoke-Genesys -Method POST -Uri $startUri -BodyObj $payload
+  Write-Log "DEBUG: GET MU $ManagementUnitId" ([ConsoleColor]::DarkCyan)
+  $muChk = Invoke-Genesys -Method GET -Uri "$RegionBase/api/v2/workforcemanagement/managementunits/$ManagementUnitId"
+  if ($muChk.id) { Write-Log "MU visible: $($muChk.name) ($($muChk.id))" } else { Write-Log "MU visible but no name/id? Check response." }
+} catch { Write-Log "DEBUG MU visibility failed: $($_.Exception.Message)" ([ConsoleColor]::DarkYellow) }
+
+# ---- 1) POST bulk job (use literal JSON) ----
+Write-Log "Starting Historical Adherence bulk job..." ([ConsoleColor]::Cyan)
+$startUri = "$RegionBase/api/v2/workforcemanagement/adherence/historical/bulk"
+
+# Build JSON as a literal string to avoid escaping/formatting issues
+$PostBody = @"
+{
+  "items": [
+    {
+      "managementUnitId": "$ManagementUnitId",
+      "startDate": "$StartDate",
+      "endDate": "$EndDate"
+    }
+  ],
+  "timeZone": "$TimeZone"
+}
+"@
+
+try {
+  $startResp = Invoke-Genesys -Method POST -Uri $startUri -RawJsonBody $PostBody
 } catch {
   Write-Log "POST failed: $($_.Exception.Message)" ([ConsoleColor]::Red)
+  Write-Log "POST body sent: $PostBody" ([ConsoleColor]::Yellow)
   throw
 }
 
-if (-not $startResp.jobId) {
-  Write-Log "No jobId in response. Raw: $( $startResp | ConvertTo-Json -Depth 10 )" ([ConsoleColor]::Red)
-  throw "Start response did not include jobId."
+Write-Log "Raw POST response:" ([ConsoleColor]::Yellow)
+try { $startResp | ConvertTo-Json -Depth 20 | Write-Host } catch { Write-Host ($startResp | Out-String) }
+
+# Check for jobId / selfUri
+if (-not $startResp.jobId -or -not $startResp.selfUri) {
+  Write-Log "ERROR: Start response missing jobId or selfUri. Above is the raw response." ([ConsoleColor]::Red)
+  Write-Log "POST body sent again for reference:" ([ConsoleColor]::Yellow)
+  Write-Host $PostBody
+  throw "Start response did not include jobId/selfUri. See logs above."
 }
 
 $jobId   = $startResp.jobId
@@ -87,9 +113,9 @@ Write-Log "Job started. jobId=$jobId"
 Write-Log "Status URL: $statusUrl"
 if ($startResp.state) { Write-Log "Initial state: $($startResp.state)" }
 
-# 2) Poll until Complete (follow selfUri)
+# ---- 2) Poll until Complete (follow selfUri) ----
 Write-Log "Polling every $PollIntervalSeconds seconds (timeout $PollTimeoutMinutes min)..." ([ConsoleColor]::Cyan)
-Start-Sleep -Seconds 2  # small grace to avoid transient 404 immediately after creation
+Start-Sleep -Seconds 2  # tiny grace period
 
 $deadline  = (Get-Date).AddMinutes($PollTimeoutMinutes)
 $state     = $null
@@ -114,6 +140,9 @@ while ($true) {
 
   if ($state -eq 'Failed') {
     $msg = if ($status.errorMessage) { $status.errorMessage } else { 'Historical adherence job failed.' }
+    Write-Log "Job failed: $msg" ([ConsoleColor]::Red)
+    Write-Log "Full status body:" ([ConsoleColor]::Yellow)
+    try { $status | ConvertTo-Json -Depth 20 | Write-Host } catch { Write-Host ($status | Out-String) }
     throw "Job failed: $msg"
   }
 
@@ -123,7 +152,7 @@ while ($true) {
   Start-Sleep -Seconds $PollIntervalSeconds
 }
 
-# 3) Download all result files
+# ---- 3) Download all result files ----
 $urls = @()
 if ($status.downloadUrls) { $urls = @($status.downloadUrls) }
 if ($urls.Count -eq 0) {
@@ -147,7 +176,7 @@ foreach ($u in $urls) {
   }
 }
 
-# 4) Flatten to CSV (user × dayMetrics)
+# ---- 4) Flatten to CSV (user × dayMetrics) ----
 function Flatten-Adherence {
   param([string[]]$Files, [string]$CsvOut)
 
