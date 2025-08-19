@@ -223,3 +223,127 @@ Location: Select the location of your Excel file (OneDrive, SharePoint).
 Document Library / File / Table: Select your file and the table you created in the prerequisites.
 
 Power Automate will show your table's columns. Map the dynamic content from the Parse JSON - Final Adherence Data step to the correct columns (e.g., userName from JSON goes to the UserName column in Excel).
+
+
+
+
+
+
+
+<#
+.SYNOPSIS
+    This script authenticates with Genesys Cloud and submits a job request
+    for a historical adherence bulk report.
+
+.DESCRIPTION
+    1. Authenticates using Client Credentials to get an access token.
+    2. Constructs a JSON body with the specified Management Unit and date range.
+    3. Sends a POST request to the Genesys Cloud API to start the job.
+    4. Outputs the resulting Job ID and its initial status.
+
+.NOTES
+    Author: Gemini Assistant
+    Version: 1.0
+    Last Updated: 19 August 2025
+#>
+
+# =============================================================================
+# User Configuration - FILL IN YOUR DETAILS HERE
+# =============================================================================
+
+# Your Genesys Cloud OAuth Client ID
+$clientId = "YOUR_CLIENT_ID_HERE"
+
+# Your Genesys Cloud OAuth Client Secret
+$clientSecret = "YOUR_CLIENT_SECRET_HERE"
+
+# Your Genesys Cloud region (e.g., "com", "com.au", "eu-west-1.pure.cloud")
+$genesysCloudRegion = "com.au"
+
+# The ID of the Management Unit you want to query
+$managementUnitId = "YOUR_MANAGEMENT_UNIT_ID_HERE"
+
+# The timezone for the report query
+$timeZone = "Australia/Sydney"
+
+# --- Date Range Configuration ---
+# This example gets data for the full previous day.
+# The 'Z' at the end signifies UTC time, which is required by the API.
+$startDate = (Get-Date).AddDays(-1).Date.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+$endDate = (Get-Date).Date.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+
+# =============================================================================
+# Script Logic - DO NOT EDIT BELOW THIS LINE
+# =============================================================================
+
+# Construct the API and Login URLs based on the region
+$loginUrl = "https://login.mypurecloud.$($genesysCloudRegion)/oauth/token"
+$apiUrl = "https://api.mypurecloud.$($genesysCloudRegion)/api/v2/workforcemanagement/adherence/historical/bulk"
+
+# --- Step 1: Get Access Token ---
+Write-Host "Authenticating with Genesys Cloud..." -ForegroundColor Green
+
+try {
+    $authBody = @{
+        grant_type    = "client_credentials"
+        client_id     = $clientId
+        client_secret = $clientSecret
+    }
+
+    $tokenResponse = Invoke-RestMethod -Uri $loginUrl -Method Post -Body $authBody -ContentType 'application/x-www-form-urlencoded'
+    $accessToken = $tokenResponse.access_token
+    Write-Host "Successfully obtained access token."
+}
+catch {
+    Write-Error "Failed to get access token. Error: $($_.Exception.Message)"
+    # Stop the script if authentication fails
+    return
+}
+
+
+# --- Step 2: Submit the Adherence Report Job ---
+Write-Host "Submitting historical adherence job..." -ForegroundColor Green
+
+# Create the request headers
+$headers = @{
+    "Authorization"  = "Bearer $($accessToken)"
+    "Content-Type"   = "application/json"
+}
+
+# Create the request body as a PowerShell object
+$jobRequestBodyObject = @{
+    items = @(
+        @{
+            managementUnitId = $managementUnitId
+            startDate        = $startDate
+            endDate          = $endDate
+        }
+    )
+    timeZone = $timeZone
+}
+
+# Convert the PowerShell object to a JSON string for the body
+$jsonBody = $jobRequestBodyObject | ConvertTo-Json
+
+# Write-Host "Request Body:" -ForegroundColor Yellow
+# Write-Host $jsonBody
+
+try {
+    $jobResponse = Invoke-RestMethod -Uri $apiUrl -Method Post -Headers $headers -Body $jsonBody
+    
+    Write-Host "`n✅ Job successfully submitted!" -ForegroundColor Green
+    Write-Host "--------------------------------"
+    Write-Host "Job ID: $($jobResponse.id)" -ForegroundColor Cyan
+    Write-Host "Status: $($jobResponse.state)"
+    Write-Host "--------------------------------"
+    Write-Host "`nUse the Job ID above to check the status and download the report."
+
+}
+catch {
+    Write-Error "Failed to submit job. Error: $($_.Exception.Message)"
+    # Optional: Display the full error response for debugging
+    $errorResponse = $_.Exception.Response.GetResponseStream()
+    $streamReader = New-Object System.IO.StreamReader($errorResponse)
+    $errorBody = $streamReader.ReadToEnd()
+    Write-Error "API Response Body: $errorBody"
+}
