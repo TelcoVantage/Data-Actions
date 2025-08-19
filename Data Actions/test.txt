@@ -229,67 +229,171 @@ Power Automate will show your table's columns. Map the dynamic content from the 
 
 
 
-# =============================================================================
-# User Configuration - FILL IN YOUR DETAILS HERE
-# =============================================================================
+<# 
+.SYNOPSIS
+  Start a Genesys Cloud WFM Historical Adherence (bulk) job and (optionally) poll status.
 
-# Your Genesys Cloud OAuth Client ID
-$clientId = "YOUR_CLIENT_ID_HERE"
-# Your Genesys Cloud OAuth Client Secret
-$clientSecret = "YOUR_CLIENT_SECRET_HERE"
-# Your Genesys Cloud region (e.g., "com", "com.au", "eu-west-1.pure.cloud")
-$genesysCloudRegion = "com.au"
-# The ID of the Management Unit you want to query
-$managementUnitId = "YOUR_MANAGEMENT_UNIT_ID_HERE"
-# The timezone for the report query
-$timeZone = "Australia/Sydney"
-# Date Range Configuration
-$startDate = (Get-Date).AddDays(-1).Date.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-$endDate = (Get-Date).Date.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+.EXAMPLE
+  .\Start-GC-HistoricalAdherenceBulk.ps1 `
+    -ClientId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
+    -ClientSecret 'YOUR_SECRET' `
+    -ManagementUnitId 'YOUR_MU_ID' `
+    -StartDate '2025-08-11' `
+    -EndDate '2025-08-15' `
+    -Poll
 
-# =============================================================================
-# Script Logic
-# =============================================================================
+.NOTES
+  Region defaults to AU (mypurecloud.com.au). Change -RegionBase/-AuthBase if needed.
+#>
 
-$loginUrl = "https://login.mypurecloud.$($genesysCloudRegion)/oauth/token"
-$apiUrl = "https://api.mypurecloud.$($genesysCloudRegion)/api/v2/workforcemanagement/adherence/historical/bulk"
+param(
+  [Parameter(Mandatory=$true)] [string] $ClientId,
+  [Parameter(Mandatory=$true)] [string] $ClientSecret,
+  [Parameter(Mandatory=$true)] [string] $ManagementUnitId,
 
-Write-Host "Authenticating with Genesys Cloud..." -ForegroundColor Green
-try {
-    $authBody = @{ grant_type = "client_credentials"; client_id = $clientId; client_secret = $clientSecret }
-    $tokenResponse = Invoke-RestMethod -Uri $loginUrl -Method Post -Body $authBody -ContentType 'application/x-www-form-urlencoded'
-    $accessToken = $tokenResponse.access_token
-    Write-Host "Successfully obtained access token."
+  # Dates as YYYY-MM-DD (date-only is safest; avoids TZ edge cases)
+  [Parameter(Mandatory=$true)] [ValidatePattern('^\d{4}-\d{2}-\d{2}$')] [string] $StartDate,
+  [Parameter(Mandatory=$true)] [ValidatePattern('^\d{4}-\d{2}-\d{2}$')] [string] $EndDate,
+
+  # Region endpoints (AU by default)
+  [string] $RegionBase = "https://api.mypurecloud.com.au",
+  [string] $AuthBase   = "https://login.mypurecloud.com.au",
+
+  # Sydney IANA tz for the payload
+  [string] $TimeZone = "Australia/Sydney",
+
+  # Polling controls
+  [switch] $Poll,
+  [int] $PollIntervalSeconds = 15,
+  [int] $PollTimeoutMinutes  = 15
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Get-GenesysToken {
+  param([string]$AuthBase,[string]$ClientId,[string]$ClientSecret)
+
+  $tokenUri = "$AuthBase/oauth/token"
+  $body = "grant_type=client_credentials&client_id=$($ClientId)&client_secret=$($ClientSecret)"
+  $headers = @{ "Content-Type" = "application/x-www-form-urlencoded" }
+
+  $resp = Invoke-RestMethod -Method POST -Uri $tokenUri -Headers $headers -Body $body
+  if (-not $resp.access_token) { throw "No access_token in OAuth response." }
+  return $resp.access_token
 }
-catch {
-    Write-Error "Failed to get access token. Error: $($_.Exception.Message)"
+
+function Start-HistoricalAdherenceBulk {
+  param(
+    [string]$RegionBase,[string]$AccessToken,[string]$ManagementUnitId,
+    [string]$StartDate,[string]$EndDate,[string]$TimeZone
+  )
+
+  $uri = "$RegionBase/api/v2/workforcemanagement/adherence/historical/bulk"
+  $headers = @{ "Authorization" = "Bearer $AccessToken"; "Content-Type" = "application/json" }
+
+  # Using the 'items' shape (date-only; safest)
+  $payload = @{
+    items   = @(@{
+      managementUnitId = $ManagementUnitId
+      startDate        = $StartDate
+      endDate          = $EndDate
+    })
+    timeZone = $TimeZone
+  } | ConvertTo-Json -Depth 6
+
+  $resp = Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $payload
+  if (-not $resp.jobId) { throw "POST did not return a jobId. Raw: $( $resp | ConvertTo-Json -Depth 10 )" }
+
+  return $resp
+}
+
+function Get-BulkJobStatus {
+  param([string]$StatusUrl,[string]$AccessToken)
+
+  $headers = @{ "Authorization" = "Bearer $AccessToken" }
+  $resp = Invoke-RestMethod -Method GET -Uri $StatusUrl -Headers $headers
+  return $resp
+}
+
+try {
+  Write-Host "Obtaining OAuth token..." -ForegroundColor Cyan
+  $token = Get-GenesysToken -AuthBase $AuthBase -ClientId $ClientId -ClientSecret $ClientSecret
+
+  Write-Host "Starting Historical Adherence bulk job..." -ForegroundColor Cyan
+  $startResp = Start-HistoricalAdherenceBulk -RegionBase $RegionBase -AccessToken $token `
+              -ManagementUnitId $ManagementUnitId -StartDate $StartDate -EndDate $EndDate -TimeZone $TimeZone
+
+  $jobId   = $startResp.jobId
+  $selfUri = $startResp.selfUri
+
+  # Build absolute status URL from selfUri (covers relative or absolute)
+  if ($selfUri -match '^https?://') {
+    $statusUrl = $selfUri
+  } else {
+    $statusUrl = "$RegionBase$selfUri"
+  }
+
+  Write-Host ""
+  Write-Host "Job started." -ForegroundColor Green
+  Write-Host ("jobId    : {0}" -f $jobId)
+  Write-Host ("selfUri  : {0}" -f $selfUri)
+  Write-Host ("statusUrl: {0}" -f $statusUrl)
+  if ($startResp.state) { Write-Host ("state    : {0}" -f $startResp.state) }
+
+  if (-not $Poll) {
+    Write-Host "`nTip: To poll, re-run this script with -Poll." -ForegroundColor Yellow
     return
+  }
+
+  Write-Host "`nPolling job status (every $PollIntervalSeconds s, up to $PollTimeoutMinutes min)..." -ForegroundColor Cyan
+
+  $deadline = (Get-Date).AddMinutes($PollTimeoutMinutes)
+  $lastState = $null
+
+  Start-Sleep -Seconds 2  # tiny grace period to avoid transient 404s
+  do {
+    try {
+      $status = Get-BulkJobStatus -StatusUrl $statusUrl -AccessToken $token
+    } catch {
+      # transient 404s right after creation; wait and retry
+      Write-Host "Transient error while polling: $($_.Exception.Message)" -ForegroundColor DarkYellow
+      Start-Sleep -Seconds $PollIntervalSeconds
+      continue
+    }
+
+    $state = $status.state
+    if ($state -ne $lastState) {
+      Write-Host ("[{0}] state = {1}" -f (Get-Date), $state)
+      $lastState = $state
+    }
+
+    if ($state -eq 'Failed') {
+      $msg = if ($status.errorMessage) { $status.errorMessage } else { 'Historical adherence job failed.' }
+      throw "Job failed: $msg"
+    }
+
+    if ($state -ne 'Complete') {
+      Start-Sleep -Seconds $PollIntervalSeconds
+    }
+
+  } while ($state -ne 'Complete' -and (Get-Date) -lt $deadline)
+
+  if ($state -ne 'Complete') {
+    throw "Timeout waiting for job to Complete."
+  }
+
+  Write-Host "`nJob Complete." -ForegroundColor Green
+
+  if ($status.downloadUrls -and $status.downloadUrls.Count -gt 0) {
+    Write-Host "downloadUrls:" -ForegroundColor Green
+    $status.downloadUrls | ForEach-Object { Write-Host "  $_" }
+  } else {
+    Write-Host "No downloadUrls returned (empty result set for given dates/users)." -ForegroundColor Yellow
+  }
+
+} catch {
+  Write-Error $_.Exception.Message
+  if ($_.ErrorDetails) { Write-Host ($_.ErrorDetails | Out-String) }
+  exit 1
 }
 
-Write-Host "Submitting historical adherence job..." -ForegroundColor Green
-$headers = @{ "Authorization"  = "Bearer $($accessToken)"; "Content-Type"   = "application/json" }
-$jobRequestBodyObject = @{
-    items = @( @{ managementUnitId = $managementUnitId; startDate = $startDate; endDate = $endDate } )
-    timeZone = $timeZone
-}
-$jsonBody = $jobRequestBodyObject | ConvertTo-Json
-
-try {
-    $jobResponse = Invoke-RestMethod -Uri $apiUrl -Method Post -Headers $headers -Body $jsonBody
-    
-    Write-Host "`n✅ Job successfully submitted!" -ForegroundColor Green
-    Write-Host "--------------------------------"
-    Write-Host "Job ID: $($jobResponse.id)" -ForegroundColor Cyan
-    Write-Host "Status: $($jobResponse.state)"
-    Write-Host "--------------------------------"
-}
-catch {
-    # --- ENHANCED ERROR HANDLING ---
-    $errorResponse = $_.Exception.Response
-    $statusCode = [int]$errorResponse.StatusCode
-    $streamReader = New-Object System.IO.StreamReader($errorResponse.GetResponseStream())
-    $errorBody = $streamReader.ReadToEnd()
-
-    Write-Error "🔴 Failed to submit job. HTTP Status Code: $statusCode"
-    Write-Error "API Error Response: $errorBody"
-}
