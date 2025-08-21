@@ -1,12 +1,12 @@
-Install-Module MicrosoftTeams -Force
+# 1. Install Teams module (only needed first time, no admin required)
+Install-Module MicrosoftTeams -Scope CurrentUser -Force
 Import-Module MicrosoftTeams
+
+# 2. Connect to Teams
 Connect-MicrosoftTeams
 
-
-Get-CsCallQueue | Select-Object Identity, Name
-
-
-# Replace with your call queue Identity
+# 3. Get one queue by name (replace with your queue’s name)
 $queue = Get-CsCallQueue -Identity "AU Main"
 
+# 4. List agents and their opt-in status
 $queue.Agents | Select-Object Name, UserPrincipalName, OptOut
