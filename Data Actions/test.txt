@@ -1,25 +1,12 @@
-Calendar =
-VAR MinDate = MIN('Adherence'[LocalDate])
-VAR MaxDate = MAX('Adherence'[LocalDate])
-RETURN
-ADDCOLUMNS(
-    CALENDAR(MinDate, MaxDate),
-    "Year", YEAR([Date]),
-    "Month", FORMAT([Date], "MMM"),
-    "MonthNum", MONTH([Date]),
-    "WeekNum", WEEKNUM([Date], 2),          -- 2 = week starts Monday
-    "Day", DAY([Date]),
-    "Dow", FORMAT([Date], "ddd")
-)
+Install-Module MicrosoftTeams -Force
+Import-Module MicrosoftTeams
+Connect-MicrosoftTeams
 
 
+Get-CsCallQueue | Select-Object Identity, Name
 
 
-Agent =
-SUMMARIZE(
-    'Adherence',
-    'Adherence'[AgentId],
-    'Adherence'[AgentName],
-    'Adherence'[Team],
-    'Adherence'[ManagementUnit]
-)
+# Replace with your call queue Identity
+$queue = Get-CsCallQueue -Identity "AU Main"
+
+$queue.Agents | Select-Object Name, UserPrincipalName, OptOut
