@@ -1,98 +1,201 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+<# 
+  Export Architect WORKFLOW execution data (the exact path it took) to CSV.
+  Region: AU (mypurecloud.com.au). Works for any region by changing $Region.
 
-import csv, time, requests
+  What this script can do:
+    A) Launch a workflow now (POST /api/v2/flows/executions) to get its executionId
+    B) Or use one/more existing executionIds (from Architect > Execution History / Query Builder)
+       then start a download job for each, poll until ready, download JSON, and flatten to CSV.
 
-# ====== CONFIGURATION ======
-REGION = "mypurecloud.com.au"
-CLIENT_ID = "YOUR_CLIENT_ID_HERE"
-CLIENT_SECRET = "YOUR_CLIENT_SECRET_HERE"
+  Prereqs:
+    - Historical execution data enabled for Architect flows, then republish. 
+    - OAuth client with Architect permissions to read execution data.
 
-# Replace with real flowExecutionIds (you get them from Architect Query Builder or notifications)
-FLOW_EXECUTION_IDS = [
-    "11111111-aaaa-bbbb-cccc-222222222222"
-]
+#>
 
-OUT_CSV = "flow_execution_paths.csv"
+# ================== CONFIG ==================
+$Region        = "mypurecloud.com.au"  # AU
+$CLIENT_ID     = "REPLACE_WITH_CLIENT_ID"
+$CLIENT_SECRET = "REPLACE_WITH_CLIENT_SECRET"
 
-def auth():
-    r = requests.post(
-        f"https://login.{REGION}/oauth/token",
-        data={"grant_type": "client_credentials"},
-        auth=(CLIENT_ID, CLIENT_SECRET),
-        timeout=30
-    )
-    r.raise_for_status()
-    return r.json()["access_token"]
+# Option A: (Recommended for testing) Run a Workflow now and capture its executionId
+$RunWorkflowNow   = $false           # set $true to launch a workflow
+$WorkflowFlowId   = "REPLACE_WITH_WORKFLOW_FLOW_ID"  # the Architect FLOW ID of the Workflow (not version id)
+$WorkflowNameHint = "PS-Demo-Run"    # optional name shown in execution history
+$WorkflowInput    = @{ }             # put your Flow.Input vars here, e.g. @{ caseId = "12345"; priority = "High" }
 
-def start_download_job(token, flow_execution_id):
-    url = f"https://api.{REGION}/api/v2/flows/executions/{flow_execution_id}/download/jobs"
-    r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-    r.raise_for_status()
-    return r.json()["id"]
+# Option B: Use existing workflow execution IDs (from Execution History / Query Builder / notifications)
+$ExecutionIds = @(
+    # "11111111-aaaa-bbbb-cccc-222222222222"
+)
 
-def get_job_result(token, job_id):
-    url = f"https://api.{REGION}/api/v2/flows/executions/download/jobs/{job_id}"
-    while True:
-        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("status") in ("Complete","Completed","READY","Ready"):
-            return data
-        if data.get("status") in ("Failed","Error"):
-            raise RuntimeError(f"Job failed: {data}")
-        time.sleep(2)
+$OutCsv = "workflow_execution_paths.csv"
+# ============================================
 
-def download_payload(result):
-    if "downloadUrl" in result:
-        r = requests.get(result["downloadUrl"], timeout=60)
-        r.raise_for_status()
-        return r.json()
-    return result.get("results") or result
+function Get-AccessToken {
+  $pair  = "{0}:{1}" -f $CLIENT_ID, $CLIENT_SECRET
+  $b64   = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+  $hdrs  = @{
+    "Authorization" = "Basic $b64"
+    "Content-Type"  = "application/x-www-form-urlencoded"
+  }
+  $body  = "grant_type=client_credentials"
+  $resp  = Invoke-RestMethod -Method Post -Uri "https://login.$Region/oauth/token" -Headers $hdrs -Body $body -TimeoutSec 60
+  return $resp.access_token
+}
 
-def flatten(flow_exec_json):
-    flow_meta = flow_exec_json.get("flow", {})
-    base = {
-        "conversationId": flow_meta.get("conversationId"),
-        "flowName": flow_meta.get("flowName"),
-        "flowVersion": flow_meta.get("flowVersion"),
+function Start-WorkflowExecution {
+  param($Token, $FlowId, $NameHint, $InputObject)
+
+  $url  = "https://api.$Region/api/v2/flows/executions"
+  $hdrs = @{ Authorization = "Bearer $Token" }
+  $body = @{
+    flowId    = $FlowId
+    name      = $NameHint
+    inputData = $InputObject
+  } | ConvertTo-Json -Depth 10
+
+  $resp = Invoke-RestMethod -Method Post -Uri $url -Headers $hdrs -Body $body -ContentType "application/json" -TimeoutSec 60
+
+  # Different orgs/versions may return 'id' or 'flowExecutionId'
+  if ($resp.flowExecutionId) { return $resp.flowExecutionId }
+  elseif ($resp.id)         { return $resp.id }
+  else                      { throw "No execution id returned from POST /flows/executions" }
+}
+
+function Start-DownloadJob {
+  param($Token, $ExecutionId)
+
+  # Start job to prepare a download for ONE execution instance
+  $url  = "https://api.$Region/api/v2/flows/executions/$ExecutionId/download/jobs"
+  $hdrs = @{ Authorization = "Bearer $Token" }
+  $resp = Invoke-RestMethod -Method Post -Uri $url -Headers $hdrs -TimeoutSec 60
+
+  # Some responses return 'id', some 'jobId'
+  if ($resp.jobId) { return $resp.jobId }
+  elseif ($resp.id){ return $resp.id }
+  else             { throw "No job id returned when starting download job." }
+}
+
+function Get-DownloadJobResult {
+  param($Token, $JobId)
+
+  $url   = "https://api.$Region/api/v2/flows/executions/download/jobs/$JobId"
+  $hdrs  = @{ Authorization = "Bearer $Token" }
+
+  for ($i=0; $i -lt 90; $i++) {
+    $resp = Invoke-RestMethod -Method Get -Uri $url -Headers $hdrs -TimeoutSec 60
+    $status = $resp.status
+    if ($status -in @("Complete","Completed","Ready","READY")) {
+      return $resp
     }
-    rows = []
-    for item in flow_meta.get("execution", []):
-        k = next(iter(item))
-        v = item[k]
-        rows.append({
-            **base,
-            "executionItem": k,
-            "actionId": v.get("actionId"),
-            "dateTime": v.get("dateTime"),
-            "outputPathId": v.get("outputPathId"),
-            "outputVariables": v.get("outputVariables")
-        })
-    return rows
+    if ($status -in @("Failed","Error")) {
+      throw ("Download job failed: " + ($resp | ConvertTo-Json -Depth 10))
+    }
+    Start-Sleep -Seconds 2
+  }
+  throw "Timed out waiting for download job to be ready."
+}
 
-def main():
-    token = auth()
-    all_rows = []
-    for fxid in FLOW_EXECUTION_IDS:
-        job_id = start_download_job(token, fxid)
-        result = get_job_result(token, job_id)
-        payload = download_payload(result)
-        if isinstance(payload, dict) and "flow" in payload:
-            all_rows.extend(flatten(payload))
-        elif isinstance(payload, list):
-            for p in payload:
-                if isinstance(p, dict) and "flow" in p:
-                    all_rows.extend(flatten(p))
+function Download-ExecutionPayload {
+  param($JobResult)
 
-    cols = ["conversationId","flowName","flowVersion","executionItem","actionId","dateTime","outputPathId","outputVariables"]
-    with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        w.writeheader()
-        for r in all_rows:
-            w.writerow(r)
+  # Some orgs return a pre-signed 'downloadUrl'; others embed results inline.
+  $url = $JobResult.downloadUrl
+  if ([string]::IsNullOrEmpty($url)) {
+    if ($JobResult.results) { return $JobResult.results }
+    else { return $JobResult } # last resort
+  }
 
-    print(f"Wrote {len(all_rows)} rows to {OUT_CSV}")
+  # If you get a /downloads/{downloadId} URI, you can GET it directly as well.
+  $raw = Invoke-RestMethod -Method Get -Uri $url -TimeoutSec 120
+  return $raw
+}
 
-if __name__ == "__main__":
-    main()
+function Flatten-ExecutionItems {
+  param($ExecJson)
+
+  # Expect either:
+  #   { "flow": { flowId, flowName, flowType, flowVersion, conversationId?, startDateTime, endDateTime, execution: [ ... ] } }
+  # or a list of such objects
+  $rows = @()
+
+  function _one($obj) {
+    $f = $obj.flow
+    if (-not $f) { return }
+
+    $base = [ordered]@{
+      conversationId = $f.conversationId
+      workflowId     = $f.flowId
+      workflowName   = $f.flowName
+      version        = $f.flowVersion
+      flowType       = $f.flowType
+      flowStart      = $f.startDateTime
+      flowEnd        = $f.endDateTime
+      flowExitReason = $f.flowExitReason
+    }
+
+    foreach ($item in $f.execution) {
+      $k = $item.PSObject.Properties.Name | Select-Object -First 1
+      $v = $item.$k
+
+      $rows += [pscustomobject]@{
+        conversationId   = $base.conversationId
+        workflowId       = $base.workflowId
+        workflowName     = $base.workflowName
+        version          = $base.version
+        flowType         = $base.flowType
+        flowStart        = $base.flowStart
+        flowEnd          = $base.flowEnd
+        flowExitReason   = $base.flowExitReason
+        executionItem    = $k
+        actionId         = $v.actionId
+        executionId      = $v.executionId
+        dateTime         = $v.dateTime
+        outputPathId     = $v.outputPathId
+        trackingId       = $v.trackingId
+        outputVariables  = if ($v.outputVariables) { ($v.outputVariables | ConvertTo-Json -Depth 10 -Compress) } else { $null }
+      }
+    }
+  }
+
+  if ($ExecJson -is [System.Collections.IEnumerable]) {
+    foreach ($x in $ExecJson) { _one $x }
+  } else {
+    _one $ExecJson
+  }
+  return $rows
+}
+
+# ---------------- Main ----------------
+$token = Get-AccessToken
+
+# Option A: run a workflow now (capture execution id)
+if ($RunWorkflowNow -eq $true) {
+  Write-Host "Launching workflow $WorkflowFlowId ..."
+  $newExecId = Start-WorkflowExecution -Token $token -FlowId $WorkflowFlowId -NameHint $WorkflowNameHint -InputObject $WorkflowInput
+  Write-Host "Started workflow. ExecutionId = $newExecId"
+  $ExecutionIds = @($newExecId)
+}
+
+if (-not $ExecutionIds -or $ExecutionIds.Count -eq 0) {
+  throw "No execution IDs provided. Either set `$RunWorkflowNow = `$true or populate `$ExecutionIds."
+}
+
+$all = @()
+foreach ($eid in $ExecutionIds) {
+  Write-Host "Starting download job for execution $eid ..."
+  $jobId   = Start-DownloadJob -Token $token -ExecutionId $eid
+  $result  = Get-DownloadJobResult -Token $token -JobId $jobId
+  $payload = Download-ExecutionPayload -JobResult $result
+  $rows    = Flatten-ExecutionItems -ExecJson $payload
+  $all    += $rows
+}
+
+# Export to CSV
+$all | Select-Object `
+  conversationId,workflowId,workflowName,version,flowType,flowStart,flowEnd,flowExitReason,
+  executionItem,actionId,executionId,dateTime,outputPathId,trackingId,outputVariables |
+  Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+
+Write-Host ("Wrote {0} rows to {1}" -f $all.Count, $OutCsv)
