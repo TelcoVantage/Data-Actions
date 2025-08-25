@@ -1,19 +1,291 @@
 # Export-Workflow-ExecutionFrames.ps1
-# Built-in PowerShell/.NET only (no external modules).
-# Output: CSV with one row per execution frame (including path taken + metadata).
+# No external modules. Works in constrained environments (no .NET property sets / no GZip handling).
+# Output: CSV with one row per execution event/frame incl. inferred path + metadata.
 
 # =========================
-# CONFIG (edit these 5 lines)
+# CONFIG (edit these)
 # =========================
 $ClientId     = 'PUT_YOUR_CLIENT_ID_HERE'
 $ClientSecret = 'PUT_YOUR_CLIENT_SECRET_HERE'
-$Environment  = 'mypurecloud.com.au'   # e.g. mypurecloud.com, mypurecloud.ie, usw2.pure.cloud
-$WorkflowName = ''                     # Optional filter (exact/partial name). Leave blank for ALL workflows.
-# Date window (local time): set either DaysBack or explicit Start/End
-$DaysBack     = 0                      # 0=today, 1=yesterday, etc. Ignored if you set $StartLocal/$EndLocal below.
+$Environment  = 'mypurecloud.com.au'   # e.g. mypurecloud.com, usw2.pure.cloud
+$WorkflowName = ''                     # Optional: exact or partial name match; leave blank for ALL workflows
+$DaysBack     = 0                      # 0=today, 1=yesterday, etc. (local time)
 
-# OPTIONAL: set explicit local dates (uncomment to use a custom window instead of $DaysBack)
-# $StartLocal = [datetime]'2025-08-01 00:00:00'
+# Optional explicit local window (overrides DaysBack) — uncomment to use
+# $StartLocal = [datetime]'2025-08-25 00:00:00'
+# $EndLocal   = [datetime]'2025-08-25 23:59:59'
+
+# Output file
+$OutCsv = Join-Path (Get-Location) ("WorkflowExecutionFrames_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date))
+
+# =========================
+# TIME WINDOW → UTC interval
+# =========================
+if (-not $StartLocal -or -not $EndLocal) {
+    $StartLocal = (Get-Date).Date.AddDays(-1 * [int]$DaysBack)
+    $EndLocal   = $StartLocal.AddDays(1).AddSeconds(-1)
+}
+$StartUtc = $StartLocal.ToUniversalTime()
+$EndUtc   = $EndLocal.ToUniversalTime()
+$Interval = '{0:o}/{1:o}' -f $StartUtc, $EndUtc
+
+# =========================
+# HELPERS (core-safe)
+# =========================
+function Get-AccessToken {
+    param([string]$ClientId,[string]$ClientSecret,[string]$LoginBase)
+
+    # Use core PSCredential + -Authentication Basic (no Base64/.NET calls)
+    $sec  = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential($ClientId, $sec)
+
+    $body = 'grant_type=client_credentials'
+    $uri  = "$LoginBase/oauth/token"
+
+    try {
+        $resp = Invoke-RestMethod -Method POST -Uri $uri -Authentication Basic -Credential $cred `
+                -ContentType 'application/x-www-form-urlencoded' -Body $body
+        if (-not $resp.access_token) { throw "No access_token in response" }
+        return $resp.access_token
+    } catch {
+        throw "Auth failed: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-GC {
+    param(
+        [Parameter(Mandatory)] [string]$Method,
+        [Parameter(Mandatory)] [string]$Path,
+        [string]$Token,
+        [object]$Body = $null
+    )
+    $headers = @{ Authorization = "Bearer $Token" }
+    $uri = if ($Path -like 'http*') { $Path } else { "https://api.$Environment$Path" }
+    if ($Body -ne $null -and -not ($Body -is [string])) { $Body = ($Body | ConvertTo-Json -Depth 10) }
+    Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -ContentType 'application/json' -Body $Body
+}
+
+function GetProp {
+    param($obj,[string]$name)
+    if ($null -eq $obj) { return $null }
+    $p = $obj.PSObject.Properties[$name]
+    if ($p) { return $p.Value } else { return $null }
+}
+
+function Get-AllWorkflows {
+    param([string]$Token)
+    $all = @()
+    $page = 1
+    while ($true) {
+        $resp = Invoke-GC -Method GET -Path "/api/v2/flows?pageSize=200&pageNumber=$page" -Token $Token
+        $entities = @()
+        if ($resp.entities) { $entities = $resp.entities }
+        elseif ($resp.items) { $entities = $resp.items }
+        if (-not $entities -or $entities.Count -eq 0) { break }
+        $all += ($entities | Where-Object { $_.type -eq 'WORKFLOW' })
+        $page++
+        # Stop if fewer than requested returned
+        if ($entities.Count -lt 200) { break }
+    }
+    return $all
+}
+
+function Find-WorkflowIds {
+    param([string]$Token,[string]$Name)
+    $flows = Get-AllWorkflows -Token $Token
+    if ([string]::IsNullOrWhiteSpace($Name)) { return ($flows.id) }
+    $matched = $flows | Where-Object { $_.name -like "*$Name*" }
+    if (-not $matched) { throw "No workflows matched name '$Name'." }
+    return ($matched.id)
+}
+
+function Query-FlowInstances {
+    param([string]$Token,[string[]]$FlowIds,[string]$Interval)
+
+    $basePreds = @(@{ type='dimension'; dimension='flowType'; value='workflow' })
+    $filter = if ($FlowIds -and $FlowIds.Count -gt 0) {
+        @{
+            type='and'
+            predicates = $basePreds
+            clauses    = @(@{
+                type='or'
+                predicates = ($FlowIds | ForEach-Object { @{ type='dimension'; dimension='flowId'; value=$_ } })
+            })
+        }
+    } else {
+        @{ type='and'; predicates = $basePreds }
+    }
+
+    $allIds = @()
+    $pageNumber = 1
+    $pageSize   = 100
+
+    while ($true) {
+        $body = @{
+            interval = $Interval
+            filter   = $filter
+            groupBy  = @('flowInstanceId','flowId','flowName','flowVersion')
+            metrics  = @()
+            paging   = @{ pageNumber = $pageNumber; pageSize = $pageSize }
+        }
+        $resp = Invoke-GC -Method POST -Path "/api/v2/analytics/flows/aggregates/query" -Token $Token -Body $body
+        if (-not $resp.results -or $resp.results.Count -eq 0) { break }
+
+        foreach ($r in $resp.results) {
+            $fid = GetProp (GetProp $r 'group') 'flowInstanceId'
+            if ($fid) { $allIds += [string]$fid }
+        }
+
+        if ($resp.results.Count -lt $pageSize) { break }
+        $pageNumber++
+    }
+
+    $allIds | Select-Object -Unique
+}
+
+function Get-ExecutionEvents {
+    param([string]$Token,[string]$Interval,[string[]]$FlowIds,[string[]]$FlowInstanceIds)
+
+    $preds = @(@{ type='dimension'; dimension='flowType'; value='workflow' })
+    $clauses = @()
+
+    if ($FlowInstanceIds -and $FlowInstanceIds.Count -gt 0) {
+        $clauses += @{
+            type='or'
+            predicates = ($FlowInstanceIds | ForEach-Object { @{ type='dimension'; dimension='flowInstanceId'; value=$_ } })
+        }
+    } elseif ($FlowIds -and $FlowIds.Count -gt 0) {
+        $clauses += @{
+            type='or'
+            predicates = ($FlowIds | ForEach-Object { @{ type='dimension'; dimension='flowId'; value=$_ } })
+        }
+    }
+
+    $filter = @{
+        type='and'
+        predicates = $preds
+        clauses    = $clauses
+    }
+
+    $events = @()
+    $pageNumber = 1
+    $pageSize   = 200
+
+    while ($true) {
+        $body = @{
+            interval = $Interval
+            filter   = $filter
+            paging   = @{ pageNumber = $pageNumber; pageSize = $pageSize }
+        }
+
+        $resp = Invoke-GC -Method POST -Path "/api/v2/analytics/flows/executions/query" -Token $Token -Body $body
+
+        # Responses may shape as { flowExecutionEvents = [...] } or { entities = [...] }
+        $batch = @()
+        if ($resp.flowExecutionEvents) { $batch = $resp.flowExecutionEvents }
+        elseif ($resp.entities)       { $batch = $resp.entities }
+
+        if (-not $batch -or $batch.Count -eq 0) { break }
+
+        $events += $batch
+
+        if ($batch.Count -lt $pageSize) { break }
+        $pageNumber++
+    }
+
+    return $events
+}
+
+function Coalesce {
+    param([Parameter(ValueFromRemainingArguments=$true)] $values)
+    foreach ($v in $values) {
+        if ($null -ne $v -and -not ([string]::IsNullOrWhiteSpace([string]$v))) { return $v }
+    }
+    $null
+}
+
+# =========================
+# MAIN
+# =========================
+$LoginBase = "https://login.$Environment"
+
+Write-Host "Authenticating to Genesys Cloud ($Environment)..." -ForegroundColor Cyan
+$Token = Get-AccessToken -ClientId $ClientId -ClientSecret $ClientSecret -LoginBase $LoginBase
+Write-Host ("OK. Interval (UTC): {0}" -f $Interval) -ForegroundColor Green
+
+# Optional: constrain by workflow name
+$FlowIds = @()
+if (-not [string]::IsNullOrWhiteSpace($WorkflowName)) {
+    Write-Host "Looking up workflows matching: $WorkflowName" -ForegroundColor Cyan
+    $FlowIds = Find-WorkflowIds -Token $Token -Name $WorkflowName
+    Write-Host ("Matched {0} workflow id(s)." -f $FlowIds.Count) -ForegroundColor Green
+}
+
+# Step 1: enumerate flowInstanceIds (so we know volume)
+Write-Host "Querying workflow flowInstanceIds..." -ForegroundColor Cyan
+$InstanceIds = Query-FlowInstances -Token $Token -FlowIds $FlowIds -Interval $Interval
+if (-not $InstanceIds -or $InstanceIds.Count -eq 0) {
+    Write-Host "No workflow executions found in the selected interval." -ForegroundColor Yellow
+    return
+}
+Write-Host ("Found {0} instance(s)." -f $InstanceIds.Count) -ForegroundColor Green
+
+# Step 2: directly page execution events (no GZip)
+Write-Host "Fetching execution events..." -ForegroundColor Cyan
+$AllEvents = Get-ExecutionEvents -Token $Token -Interval $Interval -FlowIds $FlowIds -FlowInstanceIds $InstanceIds
+if (-not $AllEvents -or $AllEvents.Count -eq 0) {
+    Write-Host "No execution events returned (check Execution Data settings / interval)." -ForegroundColor Yellow
+    return
+}
+Write-Host ("Flattening {0} event(s)..." -f $AllEvents.Count) -ForegroundColor Cyan
+
+# Step 3: flatten to CSV rows
+$rows = foreach ($e in $AllEvents) {
+    $flowId         = Coalesce (GetProp $e 'flowId') (GetProp (GetProp $e 'flow') 'id')
+    $flowName       = Coalesce (GetProp $e 'flowName') (GetProp (GetProp $e 'flow') 'name')
+    $flowVersion    = Coalesce (GetProp $e 'flowVersion') (GetProp (GetProp $e 'flow') 'version')
+    $flowInstanceId = Coalesce (GetProp $e 'flowInstanceId') (GetProp (GetProp $e 'flow') 'flowInstanceId') (GetProp $e 'instanceId')
+    $executionId    = Coalesce (GetProp $e 'executionId') (GetProp (GetProp $e 'execution') 'id')
+    $timestampUtc   = Coalesce (GetProp $e 'eventDateTime') (GetProp $e 'timestamp')
+    $objectType     = Coalesce (GetProp $e 'objectType') (GetProp $e 'actionType')
+    $objectName     = Coalesce (GetProp $e 'objectName') (GetProp $e 'actionName')
+    $eventName      = Coalesce (GetProp $e 'eventName') (GetProp $e 'event')
+
+    $inputData  = GetProp $e 'inputData'
+    $outputData = GetProp $e 'outputData'
+    $errorInfo  = GetProp $e 'errorInfo'
+
+    # Inferred "path taken" across common block types
+    $pathTaken = Coalesce `
+        (GetProp $outputData 'path') `
+        (GetProp $outputData 'caseLabel') `
+        (GetProp $outputData 'choice') `
+        (GetProp $outputData 'selectedMenuChoice') `
+        (GetProp $outputData 'selectedValue') `
+        (GetProp $e 'framePath') `
+        (GetProp $e 'branch') `
+        (GetProp $inputData 'path') `
+        (GetProp $inputData 'choice')
+
+    [PSCustomObject]@{
+        FlowName        = $flowName
+        FlowId          = $flowId
+        FlowVersion     = $flowVersion
+        FlowInstanceId  = $flowInstanceId
+        ExecutionId     = $executionId
+        EventTimeUtc    = $timestampUtc
+        ObjectType      = $objectType
+        ObjectName      = $objectName
+        EventName       = $eventName
+        PathTaken       = $pathTaken
+        InputJson       = if ($inputData)  { $inputData  | ConvertTo-Json -Compress -Depth 8 } else { $null }
+        OutputJson      = if ($outputData) { $outputData | ConvertTo-Json -Compress -Depth 8 } else { $null }
+        ErrorJson       = if ($errorInfo)  { $errorInfo  | ConvertTo-Json -Compress -Depth 8 } else { $null }
+    }
+}
+
+$rows | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+Write-Host "`nDONE. CSV saved to:`n$OutCsv" -ForegroundColor Green# $StartLocal = [datetime]'2025-08-01 00:00:00'
 # $EndLocal   = [datetime]'2025-08-01 23:59:59'
 
 # =========================
