@@ -1,13 +1,14 @@
-#Requires -Modules GenesysCloud.PowerShell
-
 <#
 .SYNOPSIS
-    Gets a detailed, step-by-step execution log for a specific triggered workflow.
+    Exports a detailed, step-by-step execution log for all Genesys Cloud workflow instances within a given time range to a single CSV file.
 
 .DESCRIPTION
-    This script finds the most recent execution of a named workflow for the current day,
-    requests a detailed execution data job from Genesys Cloud, waits for the job to complete,
-    then downloads and displays the internal task data (inputs, outputs, errors).
+    This script works without any special modules. It authenticates directly to the Genesys Cloud API,
+    finds all workflow instances within the configured date range, and then for each instance, it:
+    1. Requests a detailed execution data job from Genesys Cloud.
+    2. Waits for the job to complete.
+    3. Downloads and processes the step-by-step log.
+    4. Compiles all data and saves it to a CSV file on your desktop.
 #>
 
 # =================================================================================
@@ -21,156 +22,231 @@ $clientId = "YOUR_CLIENT_ID"
 # Your Genesys Cloud OAuth Client Secret
 $clientSecret = "YOUR_CLIENT_SECRET"
 
-# Your Genesys Cloud environment region (e.g., "mypurecloud.com", "usw2.pure.cloud")
+# Your Genesys Cloud environment region (e.g., "mypurecloud.com", "usw2.pure.cloud", "mypurecloud.ie")
 $environment = "mypurecloud.com.au"
 
-# The EXACT name of the workflow you want to investigate
-$workflowName = "My Triggered Workflow Name"
+# --- Date Range ---
+# The start and end time for the search.
+# It's best to keep the range small (e.g., a few hours or a day) to avoid timeouts.
+$startDate = (Get-Date).AddDays(-1) # Default: 24 hours ago
+$endDate = (Get-Date)               # Default: Now
+
+# --- Output File ---
+# The full path where the final CSV report will be saved.
+$outputCsvPath = "$($env:USERPROFILE)\Desktop\GenesysFlowInstances_Report.csv"
+
 
 # =================================================================================
-# SECTION 2: AUTHENTICATION AND SETUP
+# SECTION 2: AUTHENTICATION (NO MODULES REQUIRED)
 # =================================================================================
+Write-Host "➡️ SECTION 2: AUTHENTICATING..." -ForegroundColor Yellow
+
+# Function to handle all API requests
+function Invoke-GenesysApiRequest {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Uri,
+        [Parameter(Mandatory=$true)]
+        [string]$Method,
+        [hashtable]$Headers = @{},
+        $Body
+    )
+    # Add the universal Authorization header
+    $Headers['Authorization'] = "Bearer $($script:accessToken)"
+    $Headers['Content-Type'] = 'application/json'
+
+    try {
+        $params = @{
+            Uri         = $Uri
+            Method      = $Method
+            Headers     = $Headers
+        }
+        if ($Body) {
+            $params.Body = $Body
+        }
+        return Invoke-RestMethod @params
+    }
+    catch {
+        $errorMessage = $_.Exception.Response.GetResponseStream()
+        $reader = New-Object System.IO.StreamReader($errorMessage)
+        $errorBody = $reader.ReadToEnd()
+        Write-Host "❌ API Error on $($Method) $($Uri): $errorBody" -ForegroundColor Red
+        throw "API Request Failed"
+    }
+}
+
 
 try {
-    Set-GenesysCloudEnvironment -Region $environment
-    Add-GenesysCloudToken -ClientId $clientId -ClientSecret $clientSecret -GrantType ClientCredentials | Out-Null
+    # Encode credentials for Basic Auth
+    $credentials = [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("${clientId}:${clientSecret}"))
+    $authHeaders = @{ Authorization = "Basic $credentials" }
+    $authBody = @{ grant_type = 'client_credentials' }
+    $tokenUrl = "https://login.$environment/oauth/token"
+
+    # Request the token
+    $tokenResponse = Invoke-RestMethod -Uri $tokenUrl -Method 'POST' -Headers $authHeaders -Body $authBody -ContentType 'application/x-www-form-urlencoded'
+    
+    # Store the token in a script-scoped variable so the helper function can see it
+    $script:accessToken = $tokenResponse.access_token
+
     Write-Host "✅ Successfully authenticated to Genesys Cloud." -ForegroundColor Green
 }
 catch {
-    Write-Host "❌ Authentication failed. Check your credentials and region." -ForegroundColor Red
+    Write-Host "❌ Authentication failed. Check your credentials and region in Section 1." -ForegroundColor Red
+    # Stop the script if authentication fails
     return
 }
 
-# Define the time interval for "today"
-$todayStart = (Get-Date).Date
-$interval = "{0:o}/{1:o}" -f $todayStart, $todayStart.AddDays(1).AddTicks(-1)
-Write-Host "🔍 Searching for workflow executions for today..."
+$baseApiUrl = "https://api.$environment"
 
 # =================================================================================
-# SECTION 3: FIND THE LATEST WORKFLOW EXECUTION
+# SECTION 3: FIND ALL FLOW INSTANCES IN THE DATE RANGE
 # =================================================================================
+Write-Host "➡️ SECTION 3: FINDING FLOW INSTANCES..." -ForegroundColor Yellow
 
 try {
-    # Find the workflow by name to get its ID
-    $workflow = Get-GenesysCloudFlow -Name $workflowName -Type "WORKFLOW" -Published $true
-    if (-not $workflow) {
-        throw "Workflow named '$workflowName' not found or is not a published workflow."
-    }
-    Write-Host "Found Workflow: $($workflow.name) ($($workflow.id))"
+    # Format the interval string required by the Genesys API (ISO 8601 format)
+    $interval = "{0:o}/{1:o}" -f $startDate, $endDate
+    Write-Host "🔍 Searching for flow executions between $startDate and $endDate..."
 
-    # Use an aggregate query to find all of today's executions for this workflow
-    $query = @{
+    # Use an aggregate query to find all unique flow instances in the interval
+    $queryBody = @{
         interval = $interval
-        filter   = @{ type = "and"; predicates = @(@{ type = "dimension"; dimension = "flowId"; value = $workflow.id }) }
         groupBy  = @("flowInstanceId")
-    }
-    $analyticsData = Find-GenesysCloudAnalyticsFlowAggregate -Body $query
-
-    if (-not $analyticsData.results) {
-        throw "No executions found for '$workflowName' today."
-    }
-
-    # Get the ID of the most recent execution instance
-    $latestInstance = $analyticsData.results | Sort-Object { $_.data[0].metrics.stats.max } -Descending | Select-Object -First 1
-    $flowInstanceId = $latestInstance.group.flowInstanceId
-    $executionTime = $latestInstance.data[0].metrics[0].stats.max
-
-    Write-Host "🎯 Found most recent execution to analyze: `n  ID: $flowInstanceId `n  Time: $executionTime" -ForegroundColor Cyan
-
-}
-catch {
-    Write-Host "❌ Error finding workflow execution: $($_.Exception.Message)" -ForegroundColor Red
-    return
-}
-
-
-# =================================================================================
-# SECTION 4: GET DETAILED EXECUTION LOG
-# =================================================================================
-
-try {
-    # Step 1: Create the export job
-    Write-Host "1. Requesting detailed export job..."
-    $jobBody = @{
-        filter = @{
-            type       = "and"
-            predicates = @(@{
-                    type      = "dimension"
-                    dimension = "flowInstanceId"
-                    value     = $flowInstanceId
-                })
-        }
     } | ConvertTo-Json
-    $job = Invoke-GenesysCloudApiRequest -Method POST -Uri "/api/v2/analytics/flows/executions/jobs" -Body $jobBody
-    $jobId = $job.id
-    Write-Host "   Job created with ID: $jobId"
 
-    # Step 2: Poll for job completion
-    Write-Host "2. Waiting for job to complete (this may take a minute)..."
-    $timeoutSeconds = 120
-    $startTime = Get-Date
-    while ((Get-Date) -lt $startTime.AddSeconds($timeoutSeconds)) {
-        $jobStatus = Invoke-GenesysCloudApiRequest -Method GET -Uri "/api/v2/analytics/flows/executions/jobs/$jobId"
-        if ($jobStatus.state -eq 'FULFILLED') {
-            Write-Host "   Job complete!" -ForegroundColor Green
-            break
-        }
-        if ($jobStatus.state -eq 'FAILED') {
-            throw "The export job failed. Details: $($jobStatus | ConvertTo-Json -Depth 5)"
-        }
-        Write-Host "   Current status: $($jobStatus.state). Waiting..." -ForegroundColor Gray
-        Start-Sleep -Seconds 5
+    $analyticsResponse = Invoke-GenesysApiRequest -Uri "$baseApiUrl/api/v2/analytics/flows/aggregates/query" -Method 'POST' -Body $queryBody
+
+    if (-not $analyticsResponse.results) {
+        Write-Host "✅ No workflow executions found in the specified time range." -ForegroundColor Green
+        return
     }
 
-    if ($jobStatus.state -ne 'FULFILLED') {
-        throw "Job timed out after $timeoutSeconds seconds."
-    }
-
-    # Step 3: Download and decompress the results
-    Write-Host "3. Downloading and processing results..."
-    $tempGz = New-TemporaryFile
-    $tempJson = "$($tempGz.FullName).json"
-    Invoke-WebRequest -Uri $jobStatus.resultsUrl -OutFile $tempGz.FullName
-
-    # Decompress the Gzip file
-    $fileStream = [System.IO.File]::OpenRead($tempGz.FullName)
-    $gzipStream = New-Object System.IO.Compression.GzipStream($fileStream, [System.IO.Compression.CompressionMode]::Decompress)
-    $streamReader = New-Object System.IO.StreamReader($gzipStream)
-    $jsonContent = $streamReader.ReadToEnd()
-    $streamReader.Close() # Important: close streams to release file locks
-
-    # Clean up temp file
-    Remove-Item $tempGz.FullName
-
-    # Convert the JSON content into PowerShell objects
-    $executionLog = $jsonContent | ConvertFrom-Json
+    # Extract just the IDs from the response
+    $allInstanceIds = $analyticsResponse.results.group.flowInstanceId
+    Write-Host "🎯 Found $($allInstanceIds.Count) flow instances to process." -ForegroundColor Cyan
 }
 catch {
-    Write-Host "❌ An error occurred during the export process: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "❌ Error finding workflow executions: $($_.Exception.Message)" -ForegroundColor Red
     return
 }
 
-# =================================================================================
-# SECTION 5: DISPLAY THE RESULTS
-# =================================================================================
 
-Write-Host "✅ Process Complete! Here is the step-by-step log:" -ForegroundColor Green
-Write-Host "----------------------------------------------------"
+# =================================================================================
+# SECTION 4: GET DETAILED LOG FOR EACH INSTANCE
+# =================================================================================
+Write-Host "➡️ SECTION 4: PROCESSING EACH INSTANCE (THIS CAN TAKE A LONG TIME)..." -ForegroundColor Yellow
 
-# Create a simplified, readable output from the detailed log
-$formattedLog = $executionLog.flowExecutionEvents | ForEach-Object {
-    [PSCustomObject]@{
-        Timestamp   = $_.eventDateTime
-        ActionName  = $_.objectName
-        EventType   = $_.eventName
-        # Convert input/output data to a compact JSON string for easier viewing
-        InputData   = if ($_.inputData) { $_.inputData | ConvertTo-Json -Compress -Depth 5 } else { "N/A" }
-        OutputData  = if ($_.outputData) { $_.outputData | ConvertTo-Json -Compress -Depth 5 } else { "N/A" }
-        ErrorInfo   = if ($_.errorInfo) { $_.errorInfo | ConvertTo-Json -Compress -Depth 5 } else { "N/A" }
+# This array will hold the final, formatted data for the CSV
+$finalReportData = [System.Collections.Generic.List[PSObject]]::new()
+$instanceCounter = 0
+
+foreach ($instanceId in $allInstanceIds) {
+    $instanceCounter++
+    Write-Host "----------------------------------------------------"
+    Write-Host "Processing instance $instanceCounter of $($allInstanceIds.Count): $instanceId"
+
+    try {
+        # STEP 1: Create the export job for this specific instance
+        Write-Host "  1. Requesting detailed export job..."
+        $jobRequestBody = @{
+            filter = @{
+                type       = "and"
+                predicates = @(@{
+                        type      = "dimension"
+                        dimension = "flowInstanceId"
+                        value     = $instanceId
+                    })
+            }
+        } | ConvertTo-Json
+
+        $job = Invoke-GenesysApiRequest -Uri "$baseApiUrl/api/v2/analytics/flows/executions/jobs" -Method 'POST' -Body $jobRequestBody
+        $jobId = $job.id
+        Write-Host "     Job created with ID: $jobId"
+
+        # STEP 2: Poll for job completion
+        Write-Host "  2. Waiting for job to complete..."
+        $timeoutSeconds = 180
+        $startTime = Get-Date
+        while ((Get-Date) -lt $startTime.AddSeconds($timeoutSeconds)) {
+            $jobStatus = Invoke-GenesysApiRequest -Uri "$baseApiUrl/api/v2/analytics/flows/executions/jobs/$jobId" -Method 'GET'
+            if ($jobStatus.state -eq 'FULFILLED') {
+                Write-Host "     Job complete!" -ForegroundColor Green
+                break
+            }
+            if ($jobStatus.state -eq 'FAILED') {
+                throw "The export job failed. Details: $($jobStatus | ConvertTo-Json -Depth 5)"
+            }
+            Start-Sleep -Seconds 5 # Wait before checking again
+        }
+
+        if ($jobStatus.state -ne 'FULFILLED') {
+            throw "Job timed out after $timeoutSeconds seconds."
+        }
+
+        # STEP 3: Download and decompress the results
+        Write-Host "  3. Downloading and processing results..."
+        $tempGz = New-TemporaryFile
+        
+        # Use Invoke-WebRequest for downloading the file
+        Invoke-WebRequest -Uri $jobStatus.resultsUrl -OutFile $tempGz.FullName
+
+        # Decompress the Gzip file
+        $fileStream = [System.IO.File]::OpenRead($tempGz.FullName)
+        $gzipStream = New-Object System.IO.Compression.GzipStream($fileStream, [System.IO.Compression.CompressionMode]::Decompress)
+        $streamReader = New-Object System.IO.StreamReader($gzipStream)
+        $jsonContent = $streamReader.ReadToEnd()
+        $streamReader.Close()
+        $gzipStream.Close()
+        $fileStream.Close()
+
+        # Clean up the downloaded temporary file
+        Remove-Item $tempGz.FullName -Force
+
+        # Convert the JSON content into PowerShell objects
+        $executionLog = $jsonContent | ConvertFrom-Json
+
+        # STEP 4: Format and add the data to our final report collection
+        $executionLog.flowExecutionEvents | ForEach-Object {
+            $row = [PSCustomObject]@{
+                FlowInstanceId = $instanceId # Add the instance ID for context
+                Timestamp      = $_.eventDateTime
+                FlowName       = $_.flowName
+                FlowVersion    = $_.flowVersion
+                ActionName     = $_.objectName
+                ActionType     = $_.objectType
+                EventType      = $_.eventName
+                # Convert complex input/output data to a compact JSON string for easier viewing in CSV
+                InputData      = if ($_.inputData) { $_.inputData | ConvertTo-Json -Compress -Depth 5 } else { "N/A" }
+                OutputData     = if ($_.outputData) { $_.outputData | ConvertTo-Json -Compress -Depth 5 } else { "N/A" }
+                ErrorInfo      = if ($_.errorInfo) { $_.errorInfo | ConvertTo-Json -Compress -Depth 5 } else { "N/A" }
+            }
+            $finalReportData.Add($row)
+        }
+    }
+    catch {
+        Write-Host "❌ An error occurred processing instance $instanceId: $($_.Exception.Message)" -ForegroundColor Red
+        # Continue to the next instance
+        continue
     }
 }
 
-# Display the results. Out-GridView is excellent for exploring the nested data.
-$formattedLog | Out-GridView -Title "Execution Log for $workflowName"
+# =================================================================================
+# SECTION 5: EXPORT TO CSV
+# =================================================================================
+Write-Host "----------------------------------------------------"
+Write-Host "➡️ SECTION 5: EXPORTING RESULTS..." -ForegroundColor Yellow
 
-Write-Host "A Grid View window has opened with the detailed log. You can filter, sort, and copy data from it."
+if ($finalReportData.Count -gt 0) {
+    try {
+        $finalReportData | Export-Csv -Path $outputCsvPath -NoTypeInformation -Encoding UTF8
+        Write-Host "✅ Process Complete! Exported $($finalReportData.Count) total steps to:" -ForegroundColor Green
+        Write-Host "   $outputCsvPath"
+    }
+    catch {
+        Write-Host "❌ Failed to write CSV file: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+else {
+    Write-Host "✅ Process complete, but no detailed execution data was found to export." -ForegroundColor Green
+}
