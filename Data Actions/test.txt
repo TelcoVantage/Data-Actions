@@ -1,97 +1,73 @@
 <# 
-  Export Architect WORKFLOW execution data (the exact path it took) to CSV.
-  Region: AU (mypurecloud.com.au). Works for any region by changing $Region.
-
-  What this script can do:
-    A) Launch a workflow now (POST /api/v2/flows/executions) to get its executionId
-    B) Or use one/more existing executionIds (from Architect > Execution History / Query Builder)
-       then start a download job for each, poll until ready, download JSON, and flatten to CSV.
-
-  Prereqs:
-    - Historical execution data enabled for Architect flows, then republish. 
-    - OAuth client with Architect permissions to read execution data.
-
+  Export Architect WORKFLOW execution data (paths/branches) to CSV
+  - Works in ConstrainedLanguage (no .NET method calls needed)
+  - Region: AU (mypurecloud.com.au)
 #>
 
 # ================== CONFIG ==================
-$Region        = "mypurecloud.com.au"  # AU
+$Region        = "mypurecloud.com.au"  # change if needed
 $CLIENT_ID     = "REPLACE_WITH_CLIENT_ID"
 $CLIENT_SECRET = "REPLACE_WITH_CLIENT_SECRET"
 
-# Option A: (Recommended for testing) Run a Workflow now and capture its executionId
-$RunWorkflowNow   = $false           # set $true to launch a workflow
-$WorkflowFlowId   = "REPLACE_WITH_WORKFLOW_FLOW_ID"  # the Architect FLOW ID of the Workflow (not version id)
-$WorkflowNameHint = "PS-Demo-Run"    # optional name shown in execution history
-$WorkflowInput    = @{ }             # put your Flow.Input vars here, e.g. @{ caseId = "12345"; priority = "High" }
+# Option A: run a workflow now (POST /api/v2/flows/executions) to get executionId
+$RunWorkflowNow   = $false
+$WorkflowFlowId   = "REPLACE_WITH_WORKFLOW_FLOW_ID"  # the Architect WORKFLOW flowId
+$WorkflowNameHint = "PS-Demo-Run"
+$WorkflowInput    = @{}  # e.g. @{ caseId = "12345"; priority = "High" }
 
-# Option B: Use existing workflow execution IDs (from Execution History / Query Builder / notifications)
+# Option B: use existing execution IDs (copy from Execution History / Query Builder)
 $ExecutionIds = @(
-    # "11111111-aaaa-bbbb-cccc-222222222222"
+  # "11111111-aaaa-bbbb-cccc-222222222222"
 )
 
 $OutCsv = "workflow_execution_paths.csv"
 # ============================================
 
 function Get-AccessToken {
-  $pair  = "{0}:{1}" -f $CLIENT_ID, $CLIENT_SECRET
-  $b64   = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
-  $hdrs  = @{
-    "Authorization" = "Basic $b64"
-    "Content-Type"  = "application/x-www-form-urlencoded"
-  }
-  $body  = "grant_type=client_credentials"
-  $resp  = Invoke-RestMethod -Method Post -Uri "https://login.$Region/oauth/token" -Headers $hdrs -Body $body -TimeoutSec 60
+  # Avoid Basic header & .NET; send creds in x-www-form-urlencoded body
+  $hdrs = @{ "Content-Type" = "application/x-www-form-urlencoded" }
+  $body = "grant_type=client_credentials&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET"
+  $uri  = "https://login.$Region/oauth/token"
+  $resp = Invoke-RestMethod -Method Post -Uri $uri -Headers $hdrs -Body $body -TimeoutSec 60
+  if (-not $resp.access_token) { throw "OAuth failed: no access_token in response." }
   return $resp.access_token
 }
 
 function Start-WorkflowExecution {
   param($Token, $FlowId, $NameHint, $InputObject)
-
   $url  = "https://api.$Region/api/v2/flows/executions"
   $hdrs = @{ Authorization = "Bearer $Token" }
-  $body = @{
+  $bodyObj = @{
     flowId    = $FlowId
     name      = $NameHint
     inputData = $InputObject
-  } | ConvertTo-Json -Depth 10
-
+  }
+  $body = $bodyObj | ConvertTo-Json -Depth 10
   $resp = Invoke-RestMethod -Method Post -Uri $url -Headers $hdrs -Body $body -ContentType "application/json" -TimeoutSec 60
-
-  # Different orgs/versions may return 'id' or 'flowExecutionId'
   if ($resp.flowExecutionId) { return $resp.flowExecutionId }
-  elseif ($resp.id)         { return $resp.id }
-  else                      { throw "No execution id returned from POST /flows/executions" }
+  if ($resp.id)             { return $resp.id }
+  throw "No execution id returned from POST /flows/executions"
 }
 
 function Start-DownloadJob {
   param($Token, $ExecutionId)
-
-  # Start job to prepare a download for ONE execution instance
   $url  = "https://api.$Region/api/v2/flows/executions/$ExecutionId/download/jobs"
   $hdrs = @{ Authorization = "Bearer $Token" }
   $resp = Invoke-RestMethod -Method Post -Uri $url -Headers $hdrs -TimeoutSec 60
-
-  # Some responses return 'id', some 'jobId'
   if ($resp.jobId) { return $resp.jobId }
-  elseif ($resp.id){ return $resp.id }
-  else             { throw "No job id returned when starting download job." }
+  if ($resp.id)    { return $resp.id }
+  throw "No job id returned when starting download job."
 }
 
 function Get-DownloadJobResult {
   param($Token, $JobId)
-
-  $url   = "https://api.$Region/api/v2/flows/executions/download/jobs/$JobId"
-  $hdrs  = @{ Authorization = "Bearer $Token" }
-
-  for ($i=0; $i -lt 90; $i++) {
+  $url  = "https://api.$Region/api/v2/flows/executions/download/jobs/$JobId"
+  $hdrs = @{ Authorization = "Bearer $Token" }
+  for ($i=0; $i -lt 120; $i++) {
     $resp = Invoke-RestMethod -Method Get -Uri $url -Headers $hdrs -TimeoutSec 60
-    $status = $resp.status
-    if ($status -in @("Complete","Completed","Ready","READY")) {
-      return $resp
-    }
-    if ($status -in @("Failed","Error")) {
-      throw ("Download job failed: " + ($resp | ConvertTo-Json -Depth 10))
-    }
+    $status = "$($resp.status)"
+    if ($status -in @("Complete","Completed","Ready","READY")) { return $resp }
+    if ($status -in @("Failed","Error")) { throw ("Download job failed: " + ($resp | ConvertTo-Json -Depth 6)) }
     Start-Sleep -Seconds 2
   }
   throw "Timed out waiting for download job to be ready."
@@ -99,32 +75,27 @@ function Get-DownloadJobResult {
 
 function Download-ExecutionPayload {
   param($JobResult)
-
-  # Some orgs return a pre-signed 'downloadUrl'; others embed results inline.
-  $url = $JobResult.downloadUrl
-  if ([string]::IsNullOrEmpty($url)) {
-    if ($JobResult.results) { return $JobResult.results }
-    else { return $JobResult } # last resort
+  # Some orgs return a pre-signed downloadUrl; others embed 'results'
+  if ($JobResult.PSObject.Properties.Name -contains 'downloadUrl' -and $JobResult.downloadUrl) {
+    return (Invoke-RestMethod -Method Get -Uri $JobResult.downloadUrl -TimeoutSec 120)
   }
-
-  # If you get a /downloads/{downloadId} URI, you can GET it directly as well.
-  $raw = Invoke-RestMethod -Method Get -Uri $url -TimeoutSec 120
-  return $raw
+  if ($JobResult.PSObject.Properties.Name -contains 'results' -and $JobResult.results) {
+    return $JobResult.results
+  }
+  return $JobResult
 }
 
 function Flatten-ExecutionItems {
   param($ExecJson)
 
-  # Expect either:
-  #   { "flow": { flowId, flowName, flowType, flowVersion, conversationId?, startDateTime, endDateTime, execution: [ ... ] } }
-  # or a list of such objects
   $rows = @()
 
-  function _one($obj) {
+  function Add-One($obj) {
+    if (-not $obj) { return }
     $f = $obj.flow
     if (-not $f) { return }
 
-    $base = [ordered]@{
+    $base = @{
       conversationId = $f.conversationId
       workflowId     = $f.flowId
       workflowName   = $f.flowName
@@ -135,67 +106,78 @@ function Flatten-ExecutionItems {
       flowExitReason = $f.flowExitReason
     }
 
-    foreach ($item in $f.execution) {
-      $k = $item.PSObject.Properties.Name | Select-Object -First 1
-      $v = $item.$k
+    foreach ($item in ($f.execution | ForEach-Object { $_ })) {
+      # Each item is a single-key object (e.g., actionDecision, actionDataAction, actionEndWorkflow, etc.)
+      $firstKey = ($item | Get-Member -MemberType NoteProperty | Select-Object -First 1 -ExpandProperty Name)
+      $v = $item.$firstKey
+
+      $outVars = $null
+      if ($v.PSObject.Properties.Name -contains 'outputVariables' -and $v.outputVariables) {
+        $outVars = ($v.outputVariables | ConvertTo-Json -Depth 10 -Compress)
+      }
 
       $rows += [pscustomobject]@{
-        conversationId   = $base.conversationId
-        workflowId       = $base.workflowId
-        workflowName     = $base.workflowName
-        version          = $base.version
-        flowType         = $base.flowType
-        flowStart        = $base.flowStart
-        flowEnd          = $base.flowEnd
-        flowExitReason   = $base.flowExitReason
-        executionItem    = $k
-        actionId         = $v.actionId
-        executionId      = $v.executionId
-        dateTime         = $v.dateTime
-        outputPathId     = $v.outputPathId
-        trackingId       = $v.trackingId
-        outputVariables  = if ($v.outputVariables) { ($v.outputVariables | ConvertTo-Json -Depth 10 -Compress) } else { $null }
+        conversationId  = $base.conversationId
+        workflowId      = $base.workflowId
+        workflowName    = $base.workflowName
+        version         = $base.version
+        flowType        = $base.flowType
+        flowStart       = $base.flowStart
+        flowEnd         = $base.flowEnd
+        flowExitReason  = $base.flowExitReason
+        executionItem   = $firstKey
+        actionId        = $v.actionId
+        executionId     = $v.executionId
+        dateTime        = $v.dateTime
+        outputPathId    = $v.outputPathId
+        trackingId      = $v.trackingId
+        outputVariables = $outVars
       }
     }
   }
 
-  if ($ExecJson -is [System.Collections.IEnumerable]) {
-    foreach ($x in $ExecJson) { _one $x }
+  if ($ExecJson -is [System.Collections.IEnumerable] -and -not ($ExecJson -is [string])) {
+    foreach ($x in $ExecJson) { Add-One $x }
   } else {
-    _one $ExecJson
+    Add-One $ExecJson
   }
+
   return $rows
 }
 
 # ---------------- Main ----------------
-$token = Get-AccessToken
+try {
+  $token = Get-AccessToken
 
-# Option A: run a workflow now (capture execution id)
-if ($RunWorkflowNow -eq $true) {
-  Write-Host "Launching workflow $WorkflowFlowId ..."
-  $newExecId = Start-WorkflowExecution -Token $token -FlowId $WorkflowFlowId -NameHint $WorkflowNameHint -InputObject $WorkflowInput
-  Write-Host "Started workflow. ExecutionId = $newExecId"
-  $ExecutionIds = @($newExecId)
+  if ($RunWorkflowNow -eq $true) {
+    Write-Host "Launching workflow $WorkflowFlowId ..."
+    $newExecId = Start-WorkflowExecution -Token $token -FlowId $WorkflowFlowId -NameHint $WorkflowNameHint -InputObject $WorkflowInput
+    Write-Host "Started workflow. ExecutionId = $newExecId"
+    $ExecutionIds = @($newExecId)
+  }
+
+  if (-not $ExecutionIds -or $ExecutionIds.Count -eq 0) {
+    throw "No execution IDs provided. Set `$RunWorkflowNow = `$true or populate `$ExecutionIds."
+  }
+
+  $all = @()
+  foreach ($eid in $ExecutionIds) {
+    Write-Host "Preparing download for execution $eid ..."
+    $jobId   = Start-DownloadJob -Token $token -ExecutionId $eid
+    $result  = Get-DownloadJobResult -Token $token -JobId $jobId
+    $payload = Download-ExecutionPayload -JobResult $result
+    $rows    = Flatten-ExecutionItems -ExecJson $payload
+    $all    += $rows
+  }
+
+  $all | Select-Object `
+    conversationId,workflowId,workflowName,version,flowType,flowStart,flowEnd,flowExitReason,
+    executionItem,actionId,executionId,dateTime,outputPathId,trackingId,outputVariables |
+    Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+
+  Write-Host ("Wrote {0} rows to {1}" -f $all.Count, $OutCsv)
+
+} catch {
+  Write-Error $_
+  exit 1
 }
-
-if (-not $ExecutionIds -or $ExecutionIds.Count -eq 0) {
-  throw "No execution IDs provided. Either set `$RunWorkflowNow = `$true or populate `$ExecutionIds."
-}
-
-$all = @()
-foreach ($eid in $ExecutionIds) {
-  Write-Host "Starting download job for execution $eid ..."
-  $jobId   = Start-DownloadJob -Token $token -ExecutionId $eid
-  $result  = Get-DownloadJobResult -Token $token -JobId $jobId
-  $payload = Download-ExecutionPayload -JobResult $result
-  $rows    = Flatten-ExecutionItems -ExecJson $payload
-  $all    += $rows
-}
-
-# Export to CSV
-$all | Select-Object `
-  conversationId,workflowId,workflowName,version,flowType,flowStart,flowEnd,flowExitReason,
-  executionItem,actionId,executionId,dateTime,outputPathId,trackingId,outputVariables |
-  Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
-
-Write-Host ("Wrote {0} rows to {1}" -f $all.Count, $OutCsv)
