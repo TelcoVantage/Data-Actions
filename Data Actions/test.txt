@@ -1,6 +1,6 @@
 # Export-Workflow-ExecutionFrames.ps1
-# No external modules. Works in constrained environments (no .NET property sets / no GZip handling).
-# Output: CSV with one row per execution event/frame incl. inferred path + metadata.
+# Works without installing modules; CLM-safe (no property sets, no non-core .NET object creation).
+# Output: CSV with one row per execution event/frame (incl. inferred PathTaken + metadata).
 
 # =========================
 # CONFIG (edit these)
@@ -8,10 +8,10 @@
 $ClientId     = 'PUT_YOUR_CLIENT_ID_HERE'
 $ClientSecret = 'PUT_YOUR_CLIENT_SECRET_HERE'
 $Environment  = 'mypurecloud.com.au'   # e.g. mypurecloud.com, usw2.pure.cloud
-$WorkflowName = ''                     # Optional: exact or partial name match; leave blank for ALL workflows
+$WorkflowName = ''                     # Optional: exact/partial name; leave blank for ALL workflows
 $DaysBack     = 0                      # 0=today, 1=yesterday, etc. (local time)
 
-# Optional explicit local window (overrides DaysBack) — uncomment to use
+# Optional explicit local window (overrides DaysBack)
 # $StartLocal = [datetime]'2025-08-25 00:00:00'
 # $EndLocal   = [datetime]'2025-08-25 23:59:59'
 
@@ -30,21 +30,20 @@ $EndUtc   = $EndLocal.ToUniversalTime()
 $Interval = '{0:o}/{1:o}' -f $StartUtc, $EndUtc
 
 # =========================
-# HELPERS (core-safe)
+# HELPERS (CLM-safe)
 # =========================
 function Get-AccessToken {
     param([string]$ClientId,[string]$ClientSecret,[string]$LoginBase)
 
-    # Use core PSCredential + -Authentication Basic (no Base64/.NET calls)
-    $sec  = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
-    $cred = New-Object System.Management.Automation.PSCredential($ClientId, $sec)
-
+    # Build Basic auth header manually (no -Authentication)
+    $pair = '{0}:{1}' -f $ClientId, $ClientSecret
+    $b64  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+    $hdrs = @{ Authorization = "Basic $b64" ; 'Content-Type' = 'application/x-www-form-urlencoded' }
     $body = 'grant_type=client_credentials'
     $uri  = "$LoginBase/oauth/token"
 
     try {
-        $resp = Invoke-RestMethod -Method POST -Uri $uri -Authentication Basic -Credential $cred `
-                -ContentType 'application/x-www-form-urlencoded' -Body $body
+        $resp = Invoke-RestMethod -Method POST -Uri $uri -Headers $hdrs -Body $body
         if (-not $resp.access_token) { throw "No access_token in response" }
         return $resp.access_token
     } catch {
@@ -65,11 +64,10 @@ function Invoke-GC {
     Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -ContentType 'application/json' -Body $Body
 }
 
-function GetProp {
-    param($obj,[string]$name)
+function GetProp { param($obj,[string]$name)
     if ($null -eq $obj) { return $null }
     $p = $obj.PSObject.Properties[$name]
-    if ($p) { return $p.Value } else { return $null }
+    if ($p) { $p.Value } else { $null }
 }
 
 function Get-AllWorkflows {
@@ -83,11 +81,10 @@ function Get-AllWorkflows {
         elseif ($resp.items) { $entities = $resp.items }
         if (-not $entities -or $entities.Count -eq 0) { break }
         $all += ($entities | Where-Object { $_.type -eq 'WORKFLOW' })
-        $page++
-        # Stop if fewer than requested returned
         if ($entities.Count -lt 200) { break }
+        $page++
     }
-    return $all
+    $all
 }
 
 function Find-WorkflowIds {
@@ -96,7 +93,7 @@ function Find-WorkflowIds {
     if ([string]::IsNullOrWhiteSpace($Name)) { return ($flows.id) }
     $matched = $flows | Where-Object { $_.name -like "*$Name*" }
     if (-not $matched) { throw "No workflows matched name '$Name'." }
-    return ($matched.id)
+    ($matched.id)
 }
 
 function Query-FlowInstances {
@@ -161,11 +158,7 @@ function Get-ExecutionEvents {
         }
     }
 
-    $filter = @{
-        type='and'
-        predicates = $preds
-        clauses    = $clauses
-    }
+    $filter = @{ type='and'; predicates = $preds; clauses = $clauses }
 
     $events = @()
     $pageNumber = 1
@@ -180,7 +173,6 @@ function Get-ExecutionEvents {
 
         $resp = Invoke-GC -Method POST -Path "/api/v2/analytics/flows/executions/query" -Token $Token -Body $body
 
-        # Responses may shape as { flowExecutionEvents = [...] } or { entities = [...] }
         $batch = @()
         if ($resp.flowExecutionEvents) { $batch = $resp.flowExecutionEvents }
         elseif ($resp.entities)       { $batch = $resp.entities }
@@ -193,11 +185,10 @@ function Get-ExecutionEvents {
         $pageNumber++
     }
 
-    return $events
+    $events
 }
 
-function Coalesce {
-    param([Parameter(ValueFromRemainingArguments=$true)] $values)
+function Coalesce { param([Parameter(ValueFromRemainingArguments=$true)] $values)
     foreach ($v in $values) {
         if ($null -ne $v -and -not ([string]::IsNullOrWhiteSpace([string]$v))) { return $v }
     }
@@ -221,7 +212,7 @@ if (-not [string]::IsNullOrWhiteSpace($WorkflowName)) {
     Write-Host ("Matched {0} workflow id(s)." -f $FlowIds.Count) -ForegroundColor Green
 }
 
-# Step 1: enumerate flowInstanceIds (so we know volume)
+# Step 1: enumerate flowInstanceIds
 Write-Host "Querying workflow flowInstanceIds..." -ForegroundColor Cyan
 $InstanceIds = Query-FlowInstances -Token $Token -FlowIds $FlowIds -Interval $Interval
 if (-not $InstanceIds -or $InstanceIds.Count -eq 0) {
@@ -230,7 +221,7 @@ if (-not $InstanceIds -or $InstanceIds.Count -eq 0) {
 }
 Write-Host ("Found {0} instance(s)." -f $InstanceIds.Count) -ForegroundColor Green
 
-# Step 2: directly page execution events (no GZip)
+# Step 2: page execution events (no GZip)
 Write-Host "Fetching execution events..." -ForegroundColor Cyan
 $AllEvents = Get-ExecutionEvents -Token $Token -Interval $Interval -FlowIds $FlowIds -FlowInstanceIds $InstanceIds
 if (-not $AllEvents -or $AllEvents.Count -eq 0) {
@@ -255,12 +246,36 @@ $rows = foreach ($e in $AllEvents) {
     $outputData = GetProp $e 'outputData'
     $errorInfo  = GetProp $e 'errorInfo'
 
-    # Inferred "path taken" across common block types
     $pathTaken = Coalesce `
         (GetProp $outputData 'path') `
         (GetProp $outputData 'caseLabel') `
         (GetProp $outputData 'choice') `
         (GetProp $outputData 'selectedMenuChoice') `
+        (GetProp $outputData 'selectedValue') `
+        (GetProp $e 'framePath') `
+        (GetProp $e 'branch') `
+        (GetProp $inputData 'path') `
+        (GetProp $inputData 'choice')
+
+    [PSCustomObject]@{
+        FlowName        = $flowName
+        FlowId          = $flowId
+        FlowVersion     = $flowVersion
+        FlowInstanceId  = $flowInstanceId
+        ExecutionId     = $executionId
+        EventTimeUtc    = $timestampUtc
+        ObjectType      = $objectType
+        ObjectName      = $objectName
+        EventName       = $eventName
+        PathTaken       = $pathTaken
+        InputJson       = if ($inputData)  { $inputData  | ConvertTo-Json -Compress -Depth 8 } else { $null }
+        OutputJson      = if ($outputData) { $outputData | ConvertTo-Json -Compress -Depth 8 } else { $null }
+        ErrorJson       = if ($errorInfo)  { $errorInfo  | ConvertTo-Json -Compress -Depth 8 } else { $null }
+    }
+}
+
+$rows | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $OutCsv
+Write-Host "`nDONE. CSV saved to:`n$OutCsv" -ForegroundColor Green     (GetProp $outputData 'selectedMenuChoice') `
         (GetProp $outputData 'selectedValue') `
         (GetProp $e 'framePath') `
         (GetProp $e 'branch') `
