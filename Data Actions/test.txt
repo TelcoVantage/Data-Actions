@@ -1,12 +1,98 @@
-# 1. Install Teams module (only needed first time, no admin required)
-Install-Module MicrosoftTeams -Scope CurrentUser -Force
-Import-Module MicrosoftTeams
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-# 2. Connect to Teams
-Connect-MicrosoftTeams
+import csv, time, requests
 
-# 3. Get one queue by name (replace with your queue’s name)
-$queue = Get-CsCallQueue -Identity "AU Main"
+# ====== CONFIGURATION ======
+REGION = "mypurecloud.com.au"
+CLIENT_ID = "YOUR_CLIENT_ID_HERE"
+CLIENT_SECRET = "YOUR_CLIENT_SECRET_HERE"
 
-# 4. List agents and their opt-in status
-$queue.Agents | Select-Object Name, UserPrincipalName, OptOut
+# Replace with real flowExecutionIds (you get them from Architect Query Builder or notifications)
+FLOW_EXECUTION_IDS = [
+    "11111111-aaaa-bbbb-cccc-222222222222"
+]
+
+OUT_CSV = "flow_execution_paths.csv"
+
+def auth():
+    r = requests.post(
+        f"https://login.{REGION}/oauth/token",
+        data={"grant_type": "client_credentials"},
+        auth=(CLIENT_ID, CLIENT_SECRET),
+        timeout=30
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+def start_download_job(token, flow_execution_id):
+    url = f"https://api.{REGION}/api/v2/flows/executions/{flow_execution_id}/download/jobs"
+    r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    r.raise_for_status()
+    return r.json()["id"]
+
+def get_job_result(token, job_id):
+    url = f"https://api.{REGION}/api/v2/flows/executions/download/jobs/{job_id}"
+    while True:
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") in ("Complete","Completed","READY","Ready"):
+            return data
+        if data.get("status") in ("Failed","Error"):
+            raise RuntimeError(f"Job failed: {data}")
+        time.sleep(2)
+
+def download_payload(result):
+    if "downloadUrl" in result:
+        r = requests.get(result["downloadUrl"], timeout=60)
+        r.raise_for_status()
+        return r.json()
+    return result.get("results") or result
+
+def flatten(flow_exec_json):
+    flow_meta = flow_exec_json.get("flow", {})
+    base = {
+        "conversationId": flow_meta.get("conversationId"),
+        "flowName": flow_meta.get("flowName"),
+        "flowVersion": flow_meta.get("flowVersion"),
+    }
+    rows = []
+    for item in flow_meta.get("execution", []):
+        k = next(iter(item))
+        v = item[k]
+        rows.append({
+            **base,
+            "executionItem": k,
+            "actionId": v.get("actionId"),
+            "dateTime": v.get("dateTime"),
+            "outputPathId": v.get("outputPathId"),
+            "outputVariables": v.get("outputVariables")
+        })
+    return rows
+
+def main():
+    token = auth()
+    all_rows = []
+    for fxid in FLOW_EXECUTION_IDS:
+        job_id = start_download_job(token, fxid)
+        result = get_job_result(token, job_id)
+        payload = download_payload(result)
+        if isinstance(payload, dict) and "flow" in payload:
+            all_rows.extend(flatten(payload))
+        elif isinstance(payload, list):
+            for p in payload:
+                if isinstance(p, dict) and "flow" in p:
+                    all_rows.extend(flatten(p))
+
+    cols = ["conversationId","flowName","flowVersion","executionItem","actionId","dateTime","outputPathId","outputVariables"]
+    with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for r in all_rows:
+            w.writerow(r)
+
+    print(f"Wrote {len(all_rows)} rows to {OUT_CSV}")
+
+if __name__ == "__main__":
+    main()
