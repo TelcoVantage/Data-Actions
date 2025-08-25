@@ -1,16 +1,176 @@
-{
-  "interval": "2025-08-25T00:00:00.000Z/2025-08-26T00:00:00.000Z",
-  "filter": {
-    "type": "and",
-    "predicates": [
-      {
-        "type": "dimension",
-        "dimension": "flowId",
-        "value": "YOUR_WORKFLOW_ID_HERE"
-      }
-    ]
-  },
-  "groupBy": [
-    "flowInstanceId"
-  ]
+#Requires -Modules GenesysCloud.PowerShell
+
+<#
+.SYNOPSIS
+    Gets a detailed, step-by-step execution log for a specific triggered workflow.
+
+.DESCRIPTION
+    This script finds the most recent execution of a named workflow for the current day,
+    requests a detailed execution data job from Genesys Cloud, waits for the job to complete,
+    then downloads and displays the internal task data (inputs, outputs, errors).
+#>
+
+# =================================================================================
+# SECTION 1: CONFIGURATION
+# --- Please update these variables ---
+# =================================================================================
+
+# Your Genesys Cloud OAuth Client ID
+$clientId = "YOUR_CLIENT_ID"
+
+# Your Genesys Cloud OAuth Client Secret
+$clientSecret = "YOUR_CLIENT_SECRET"
+
+# Your Genesys Cloud environment region (e.g., "mypurecloud.com", "usw2.pure.cloud")
+$environment = "mypurecloud.com.au"
+
+# The EXACT name of the workflow you want to investigate
+$workflowName = "My Triggered Workflow Name"
+
+# =================================================================================
+# SECTION 2: AUTHENTICATION AND SETUP
+# =================================================================================
+
+try {
+    Set-GenesysCloudEnvironment -Region $environment
+    Add-GenesysCloudToken -ClientId $clientId -ClientSecret $clientSecret -GrantType ClientCredentials | Out-Null
+    Write-Host "✅ Successfully authenticated to Genesys Cloud." -ForegroundColor Green
 }
+catch {
+    Write-Host "❌ Authentication failed. Check your credentials and region." -ForegroundColor Red
+    return
+}
+
+# Define the time interval for "today"
+$todayStart = (Get-Date).Date
+$interval = "{0:o}/{1:o}" -f $todayStart, $todayStart.AddDays(1).AddTicks(-1)
+Write-Host "🔍 Searching for workflow executions for today..."
+
+# =================================================================================
+# SECTION 3: FIND THE LATEST WORKFLOW EXECUTION
+# =================================================================================
+
+try {
+    # Find the workflow by name to get its ID
+    $workflow = Get-GenesysCloudFlow -Name $workflowName -Type "WORKFLOW" -Published $true
+    if (-not $workflow) {
+        throw "Workflow named '$workflowName' not found or is not a published workflow."
+    }
+    Write-Host "Found Workflow: $($workflow.name) ($($workflow.id))"
+
+    # Use an aggregate query to find all of today's executions for this workflow
+    $query = @{
+        interval = $interval
+        filter   = @{ type = "and"; predicates = @(@{ type = "dimension"; dimension = "flowId"; value = $workflow.id }) }
+        groupBy  = @("flowInstanceId")
+    }
+    $analyticsData = Find-GenesysCloudAnalyticsFlowAggregate -Body $query
+
+    if (-not $analyticsData.results) {
+        throw "No executions found for '$workflowName' today."
+    }
+
+    # Get the ID of the most recent execution instance
+    $latestInstance = $analyticsData.results | Sort-Object { $_.data[0].metrics.stats.max } -Descending | Select-Object -First 1
+    $flowInstanceId = $latestInstance.group.flowInstanceId
+    $executionTime = $latestInstance.data[0].metrics[0].stats.max
+
+    Write-Host "🎯 Found most recent execution to analyze: `n  ID: $flowInstanceId `n  Time: $executionTime" -ForegroundColor Cyan
+
+}
+catch {
+    Write-Host "❌ Error finding workflow execution: $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+
+# =================================================================================
+# SECTION 4: GET DETAILED EXECUTION LOG
+# =================================================================================
+
+try {
+    # Step 1: Create the export job
+    Write-Host "1. Requesting detailed export job..."
+    $jobBody = @{
+        filter = @{
+            type       = "and"
+            predicates = @(@{
+                    type      = "dimension"
+                    dimension = "flowInstanceId"
+                    value     = $flowInstanceId
+                })
+        }
+    } | ConvertTo-Json
+    $job = Invoke-GenesysCloudApiRequest -Method POST -Uri "/api/v2/analytics/flows/executions/jobs" -Body $jobBody
+    $jobId = $job.id
+    Write-Host "   Job created with ID: $jobId"
+
+    # Step 2: Poll for job completion
+    Write-Host "2. Waiting for job to complete (this may take a minute)..."
+    $timeoutSeconds = 120
+    $startTime = Get-Date
+    while ((Get-Date) -lt $startTime.AddSeconds($timeoutSeconds)) {
+        $jobStatus = Invoke-GenesysCloudApiRequest -Method GET -Uri "/api/v2/analytics/flows/executions/jobs/$jobId"
+        if ($jobStatus.state -eq 'FULFILLED') {
+            Write-Host "   Job complete!" -ForegroundColor Green
+            break
+        }
+        if ($jobStatus.state -eq 'FAILED') {
+            throw "The export job failed. Details: $($jobStatus | ConvertTo-Json -Depth 5)"
+        }
+        Write-Host "   Current status: $($jobStatus.state). Waiting..." -ForegroundColor Gray
+        Start-Sleep -Seconds 5
+    }
+
+    if ($jobStatus.state -ne 'FULFILLED') {
+        throw "Job timed out after $timeoutSeconds seconds."
+    }
+
+    # Step 3: Download and decompress the results
+    Write-Host "3. Downloading and processing results..."
+    $tempGz = New-TemporaryFile
+    $tempJson = "$($tempGz.FullName).json"
+    Invoke-WebRequest -Uri $jobStatus.resultsUrl -OutFile $tempGz.FullName
+
+    # Decompress the Gzip file
+    $fileStream = [System.IO.File]::OpenRead($tempGz.FullName)
+    $gzipStream = New-Object System.IO.Compression.GzipStream($fileStream, [System.IO.Compression.CompressionMode]::Decompress)
+    $streamReader = New-Object System.IO.StreamReader($gzipStream)
+    $jsonContent = $streamReader.ReadToEnd()
+    $streamReader.Close() # Important: close streams to release file locks
+
+    # Clean up temp file
+    Remove-Item $tempGz.FullName
+
+    # Convert the JSON content into PowerShell objects
+    $executionLog = $jsonContent | ConvertFrom-Json
+}
+catch {
+    Write-Host "❌ An error occurred during the export process: $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+# =================================================================================
+# SECTION 5: DISPLAY THE RESULTS
+# =================================================================================
+
+Write-Host "✅ Process Complete! Here is the step-by-step log:" -ForegroundColor Green
+Write-Host "----------------------------------------------------"
+
+# Create a simplified, readable output from the detailed log
+$formattedLog = $executionLog.flowExecutionEvents | ForEach-Object {
+    [PSCustomObject]@{
+        Timestamp   = $_.eventDateTime
+        ActionName  = $_.objectName
+        EventType   = $_.eventName
+        # Convert input/output data to a compact JSON string for easier viewing
+        InputData   = if ($_.inputData) { $_.inputData | ConvertTo-Json -Compress -Depth 5 } else { "N/A" }
+        OutputData  = if ($_.outputData) { $_.outputData | ConvertTo-Json -Compress -Depth 5 } else { "N/A" }
+        ErrorInfo   = if ($_.errorInfo) { $_.errorInfo | ConvertTo-Json -Compress -Depth 5 } else { "N/A" }
+    }
+}
+
+# Display the results. Out-GridView is excellent for exploring the nested data.
+$formattedLog | Out-GridView -Title "Execution Log for $workflowName"
+
+Write-Host "A Grid View window has opened with the detailed log. You can filter, sort, and copy data from it."
