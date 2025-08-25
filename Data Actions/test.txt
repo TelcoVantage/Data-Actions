@@ -1,41 +1,49 @@
 # Export-Workflow-ExecutionFrames.ps1
-# Requires: nothing extra (built-in PowerShell + .NET only)
-# Output: CSV in current folder with all Workflow execution frames + metadata
+# Built-in PowerShell/.NET only (no external modules).
+# Output: CSV with one row per execution frame (including path taken + metadata).
 
 # =========================
 # CONFIG (edit these 5 lines)
 # =========================
 $ClientId     = 'PUT_YOUR_CLIENT_ID_HERE'
 $ClientSecret = 'PUT_YOUR_CLIENT_SECRET_HERE'
-$Environment  = 'mypurecloud.com.au'      # AU: mypurecloud.com.au, US-East: mypurecloud.com, etc.
-$WorkflowName = ''                        # Optional. Exact (or partial) match. Leave blank for ALL workflows.
-$DaysBack     = 0                         # 0 = today only; 1 = yesterday; etc.
+$Environment  = 'mypurecloud.com.au'   # e.g. mypurecloud.com, mypurecloud.ie, usw2.pure.cloud
+$WorkflowName = ''                     # Optional filter (exact/partial name). Leave blank for ALL workflows.
+# Date window (local time): set either DaysBack or explicit Start/End
+$DaysBack     = 0                      # 0=today, 1=yesterday, etc. Ignored if you set $StartLocal/$EndLocal below.
+
+# OPTIONAL: set explicit local dates (uncomment to use a custom window instead of $DaysBack)
+# $StartLocal = [datetime]'2025-08-01 00:00:00'
+# $EndLocal   = [datetime]'2025-08-01 23:59:59'
 
 # =========================
-# ADVANCED (usually leave as-is)
+# ADVANCED (leave as-is)
 # =========================
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $BaseApi = "https://api.$Environment"
 $Login   = "https://login.$Environment"
+$Now     = Get-Date
+$OutCsv  = Join-Path (Get-Location) ("WorkflowExecutionFrames_{0:yyyyMMdd_HHmmss}.csv" -f $Now)
 
-# Compute interval in UTC: start of (today - DaysBack) to end of that day
-$localStart = (Get-Date).Date.AddDays(-1 * [int]$DaysBack)
-$localEnd   = $localStart.AddDays(1).AddSeconds(-1)
-$startUtc   = $localStart.ToUniversalTime()
-$endUtc     = $localEnd.ToUniversalTime()
-$Interval   = "{0:o}/{1:o}" -f $startUtc, $endUtc
+# Compute interval (UTC ISO 8601)
+if (-not $StartLocal -or -not $EndLocal) {
+    $StartLocal = (Get-Date).Date.AddDays(-1 * [int]$DaysBack)
+    $EndLocal   = $StartLocal.AddDays(1).AddSeconds(-1)
+}
+$StartUtc = $StartLocal.ToUniversalTime()
+$EndUtc   = $EndLocal.ToUniversalTime()
+$Interval = "{0:o}/{1:o}" -f $StartUtc, $EndUtc
 
-$OutCsv     = Join-Path (Get-Location) ("WorkflowExecutionFrames_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date))
-
+# ----------------- Helpers -----------------
 function Get-AccessToken {
-    param(
-        [string]$ClientId, [string]$ClientSecret, [string]$Login
-    )
-    $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$ClientId:$ClientSecret"))
+    param([string]$ClientId, [string]$ClientSecret, [string]$Login)
+    $pair    = '{0}:{1}' -f $ClientId, $ClientSecret
+    $b64     = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
     $headers = @{ Authorization = "Basic $b64" }
     $body    = "grant_type=client_credentials"
     try {
-        $resp = Invoke-RestMethod -Method POST -Uri "$Login/oauth/token" -Headers $headers -ContentType "application/x-www-form-urlencoded" -Body $body
+        $resp = Invoke-RestMethod -Method POST -Uri "$Login/oauth/token" `
+            -Headers $headers -ContentType "application/x-www-form-urlencoded" -Body $body
         return $resp.access_token
     } catch {
         throw "Auth failed: $($_.Exception.Message)"
@@ -53,7 +61,7 @@ function Invoke-GC {
     $headers = @{ Authorization = "Bearer $Token" }
     if ($ExtraHeaders) { $ExtraHeaders.GetEnumerator() | ForEach-Object { $headers[$_.Key] = $_.Value } }
     $uri = if ($Path -like 'http*') { $Path } else { "$BaseApi$Path" }
-    if ($Body -ne $null -and -not ($Body -is [string])) { $Body = ($Body | ConvertTo-Json -Depth 10) }
+    if ($Body -ne $null -and -not ($Body -is [string])) { $Body = ($Body | ConvertTo-Json -Depth 12) }
     return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -ContentType "application/json" -Body $Body
 }
 
@@ -66,7 +74,6 @@ function Get-AllWorkflows {
         $entities = @()
         if ($resp.entities) { $entities = $resp.entities }
         elseif ($resp.items) { $entities = $resp.items }
-        else { $entities = @() }
         $workflows = $entities | Where-Object { $_.type -eq 'WORKFLOW' }
         $all += $workflows
         $page += 1
@@ -78,46 +85,56 @@ function Get-AllWorkflows {
 function Find-WorkflowIds {
     param([string]$Token, [string]$Name)
     $flows = Get-AllWorkflows -Token $Token
-    if ([string]::IsNullOrWhiteSpace($Name)) {
-        return $flows.id
-    } else {
-        # exact or partial (case-insensitive)
-        $matched = $flows | Where-Object { $_.name -like "*$Name*" }
-        if (-not $matched) { throw "No workflows matched name '$Name'." }
-        return $matched.id
-    }
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $flows.id }
+    $matched = $flows | Where-Object { $_.name -like "*$Name*" }
+    if (-not $matched) { throw "No workflows matched name '$Name'." }
+    return $matched.id
 }
 
 function Query-FlowInstances {
     param([string]$Token, [string[]]$FlowIds, [string]$Interval)
-    # Get all flowInstanceIds for the interval (groupBy flowInstanceId)
+
+    # Base filter: only workflows
     $preds = @(@{ type='dimension'; dimension='flowType'; value='workflow' })
-    if ($FlowIds -and $FlowIds.Count -gt 0) {
-        # We'll OR the flowIds inside a clause to avoid massive result sets
-        $flowIdPreds = $FlowIds | ForEach-Object { @{ type='dimension'; dimension='flowId'; value=$_ } }
-        $filter = @{
-            type    = 'and'
-            clauses = @(@{ type='or'; predicates = $flowIdPreds })
+
+    $filter = if ($FlowIds -and $FlowIds.Count -gt 0) {
+        @{
+            type='and'
             predicates = $preds
+            clauses    = @(@{
+                type='or'
+                predicates = ($FlowIds | ForEach-Object { @{ type='dimension'; dimension='flowId'; value=$_ } })
+            })
         }
     } else {
-        $filter = @{ type='and'; predicates = $preds }
+        @{ type='and'; predicates = $preds }
     }
 
-    $body = @{
-        interval = $Interval
-        filter   = $filter
-        groupBy  = @('flowInstanceId','flowId','flowName','flowVersion')
-        metrics  = @()  # not required
+    $pageNumber = 1
+    $pageSize   = 100
+    $allIds     = New-Object System.Collections.Generic.List[string]
+
+    while ($true) {
+        $body = @{
+            interval = $Interval
+            filter   = $filter
+            groupBy  = @('flowInstanceId','flowId','flowName','flowVersion')
+            metrics  = @()
+            paging   = @{ pageNumber = $pageNumber; pageSize = $pageSize }
+        }
+        $resp = Invoke-GC -Method POST -Path "/api/v2/analytics/flows/aggregates/query" -Token $Token -Body $body
+        if (-not $resp.results -or $resp.results.Count -eq 0) { break }
+
+        foreach ($r in $resp.results) {
+            if ($r.group.flowInstanceId) { $allIds.Add([string]$r.group.flowInstanceId) }
+        }
+
+        # stop when fewer than pageSize returned
+        if ($resp.results.Count -lt $pageSize) { break }
+        $pageNumber++
     }
 
-    $resp = Invoke-GC -Method POST -Path "/api/v2/analytics/flows/aggregates/query" -Token $Token -Body $body
-    $ids = @()
-    foreach ($r in $resp.results) {
-        if ($r.group.flowInstanceId) { $ids += $r.group.flowInstanceId }
-    }
-    $ids = $ids | Select-Object -Unique
-    return $ids
+    ($allIds.ToArray() | Select-Object -Unique)
 }
 
 function Start-ExecutionExportJob {
@@ -127,7 +144,6 @@ function Start-ExecutionExportJob {
         [string[]]$FlowInstanceIds = $null,
         [string[]]$FlowIds = $null
     )
-    # Build filter: flowType=workflow AND (OR flowInstanceIds | OR flowIds) within interval
     $predBase = @(@{ type='dimension'; dimension='flowType'; value='workflow' })
     $clauses = @()
 
@@ -136,8 +152,7 @@ function Start-ExecutionExportJob {
             type='or'
             predicates= ($FlowInstanceIds | ForEach-Object { @{ type='dimension'; dimension='flowInstanceId'; value=$_ } })
         }
-    }
-    elseif ($FlowIds -and $FlowIds.Count -gt 0) {
+    } elseif ($FlowIds -and $FlowIds.Count -gt 0) {
         $clauses += @{
             type='or'
             predicates= ($FlowIds | ForEach-Object { @{ type='dimension'; dimension='flowId'; value=$_ } })
@@ -153,16 +168,16 @@ function Start-ExecutionExportJob {
         }
     }
     $job = Invoke-GC -Method POST -Path "/api/v2/analytics/flows/executions/jobs" -Token $Token -Body $jobBody
-    return $job.id
+    $job.id
 }
 
 function Wait-Job {
-    param([string]$Token, [string]$JobId, [int]$TimeoutSec = 180)
+    param([string]$Token, [string]$JobId, [int]$TimeoutSec = 300)
     $expiry = (Get-Date).AddSeconds($TimeoutSec)
     do {
         $s = Invoke-GC -Method GET -Path "/api/v2/analytics/flows/executions/jobs/$JobId" -Token $Token
         if ($s.state -eq 'FULFILLED') { return $s.resultsUrl }
-        if ($s.state -eq 'FAILED') { throw "Export job failed: $($s | ConvertTo-Json -Depth 6)" }
+        if ($s.state -eq 'FAILED')   { throw "Export job failed: $($s | ConvertTo-Json -Depth 12)" }
         Start-Sleep -Seconds 3
     } while ((Get-Date) -lt $expiry)
     throw "Export job timed out after $TimeoutSec seconds."
@@ -172,13 +187,13 @@ function Get-JsonFromGzipUrl {
     param([string]$Url)
     $tmpGz = [System.IO.Path]::GetTempFileName()
     try {
-        Invoke-WebRequest -Uri $Url -OutFile $tmpGz -Headers @{ "Accept-Encoding"="identity" } | Out-Null
-        $fs   = [System.IO.File]::OpenRead($tmpGz)
-        $gs   = New-Object System.IO.Compression.GzipStream($fs, [System.IO.Compression.CompressionMode]::Decompress)
-        $sr   = New-Object System.IO.StreamReader($gs, [Text.Encoding]::UTF8)
+        Invoke-WebRequest -Uri $Url -OutFile $tmpGz | Out-Null
+        $fs = [System.IO.File]::OpenRead($tmpGz)
+        $gs = New-Object System.IO.Compression.GzipStream($fs, [System.IO.Compression.CompressionMode]::Decompress)
+        $sr = New-Object System.IO.StreamReader($gs, [Text.Encoding]::UTF8)
         $json = $sr.ReadToEnd()
         $sr.Close(); $gs.Close(); $fs.Close()
-        return $json
+        $json
     } finally {
         if (Test-Path $tmpGz) { Remove-Item $tmpGz -Force -ErrorAction SilentlyContinue }
     }
@@ -189,16 +204,15 @@ function Coalesce {
     foreach ($v in $values) {
         if ($null -ne $v -and -not ([string]::IsNullOrWhiteSpace([string]$v))) { return $v }
     }
-    return $null
+    $null
 }
 
-# -------------- MAIN --------------
-
+# ----------------- MAIN -----------------
 Write-Host "Authenticating to Genesys Cloud ($Environment)..." -ForegroundColor Cyan
 $Token = Get-AccessToken -ClientId $ClientId -ClientSecret $ClientSecret -Login $Login
-Write-Host "OK.`nInterval: $Interval" -ForegroundColor Green
+Write-Host ("OK. Interval (UTC): {0}" -f $Interval) -ForegroundColor Green
 
-# Resolve workflow IDs (optional filter)
+# Optional workflow name filter
 $FlowIds = @()
 if (-not [string]::IsNullOrWhiteSpace($WorkflowName)) {
     Write-Host "Finding workflow(s) matching: $WorkflowName" -ForegroundColor Cyan
@@ -206,65 +220,51 @@ if (-not [string]::IsNullOrWhiteSpace($WorkflowName)) {
     Write-Host ("Matched {0} workflow id(s)." -f $FlowIds.Count) -ForegroundColor Green
 }
 
-# Get all flow instance IDs for the interval (so we know data volume)
-Write-Host "Querying flow instances for interval..." -ForegroundColor Cyan
+# Get all flow instances in window
+Write-Host "Querying workflow flowInstanceIds for interval..." -ForegroundColor Cyan
 $InstanceIds = Query-FlowInstances -Token $Token -FlowIds $FlowIds -Interval $Interval
 if (-not $InstanceIds -or $InstanceIds.Count -eq 0) {
-    Write-Host "No workflow executions found in interval." -ForegroundColor Yellow
+    Write-Host "No workflow executions found in the selected interval." -ForegroundColor Yellow
     return
 }
-Write-Host ("Found {0} flow instance(s)." -f $InstanceIds.Count) -ForegroundColor Green
+Write-Host ("Found {0} instance(s)." -f $InstanceIds.Count) -ForegroundColor Green
 
-# Create export job(s) in manageable chunks (IDs OR interval only)
-# Job endpoint can return ALL matching executions in one file.
-# For very large sets we chunk by 200 instanceIds per job to keep request bodies reasonable.
+# Export events; chunk instanceIds to keep requests reasonable
 $AllEvents = New-Object System.Collections.Generic.List[object]
-$chunks = if ($InstanceIds.Count -gt 0) { [System.Linq.Enumerable]::ToList($InstanceIds).ToArray() } else { @() }
-if ($chunks.Count -gt 0) {
-    # Split into chunks of 200 IDs
-    $chunkSize = 200
-    for ($i=0; $i -lt $InstanceIds.Count; $i += $chunkSize) {
-        $slice = $InstanceIds[$i..([Math]::Min($i+$chunkSize-1,$InstanceIds.Count-1))]
-        Write-Host ("Starting export job for {0} instanceIds ({1}-{2})..." -f $slice.Count, $i+1, $i+$slice.Count) -ForegroundColor Cyan
-        $jobId = Start-ExecutionExportJob -Token $Token -Interval $Interval -FlowInstanceIds $slice
-        $url   = Wait-Job -Token $Token -JobId $jobId -TimeoutSec 240
-        $json  = Get-JsonFromGzipUrl -Url $url
-        $payload = $json | ConvertFrom-Json
-        # payload may be { flowExecutionEvents=[...] } or an array. Handle both.
-        $events = if ($payload.flowExecutionEvents) { $payload.flowExecutionEvents } else { $payload }
-        foreach ($e in $events) { [void]$AllEvents.Add($e) }
-    }
-} else {
-    # Fallback: interval + (optional) FlowIds filter
-    Write-Host "Starting export job for entire interval (no explicit instance list)..." -ForegroundColor Cyan
-    $jobId = Start-ExecutionExportJob -Token $Token -Interval $Interval -FlowIds $FlowIds
-    $url   = Wait-Job -Token $Token -JobId $jobId -TimeoutSec 240
+$chunkSize = 200
+for ($i = 0; $i -lt $InstanceIds.Count; $i += $chunkSize) {
+    $slice = $InstanceIds[$i..([Math]::Min($i+$chunkSize-1,$InstanceIds.Count-1))]
+    Write-Host ("Starting export job for {0} instanceIds ({1}-{2})..." -f $slice.Count, $i+1, $i+$slice.Count) -ForegroundColor Cyan
+
+    $jobId = Start-ExecutionExportJob -Token $Token -Interval $Interval -FlowInstanceIds $slice
+    $url   = Wait-Job -Token $Token -JobId $jobId -TimeoutSec 420
     $json  = Get-JsonFromGzipUrl -Url $url
+
     $payload = $json | ConvertFrom-Json
     $events = if ($payload.flowExecutionEvents) { $payload.flowExecutionEvents } else { $payload }
+
     foreach ($e in $events) { [void]$AllEvents.Add($e) }
 }
 
 if ($AllEvents.Count -eq 0) {
-    Write-Host "Export completed, but no events returned (check execution data settings / interval)." -ForegroundColor Yellow
+    Write-Host "Export completed, but no events returned (check execution data settings / permissions)." -ForegroundColor Yellow
     return
 }
 
 Write-Host ("Flattening {0} execution event(s)..." -f $AllEvents.Count) -ForegroundColor Cyan
 
 $rows = foreach ($e in $AllEvents) {
-    # Coalesce common fields defensively (structure can vary)
     $flowId         = Coalesce $e.flowId $e.flow?.id
     $flowName       = Coalesce $e.flowName $e.flow?.name
     $flowVersion    = Coalesce $e.flowVersion $e.flow?.version
     $flowInstanceId = Coalesce $e.flowInstanceId $e.flow?.flowInstanceId $e.instanceId
     $executionId    = Coalesce $e.executionId $e.execution?.id
-    $timestamp      = Coalesce $e.eventDateTime $e.timestamp
+    $timestampUtc   = Coalesce $e.eventDateTime $e.timestamp
     $objectType     = Coalesce $e.objectType $e.actionType
     $objectName     = Coalesce $e.objectName $e.actionName
     $eventName      = Coalesce $e.eventName $e.event
 
-    # Try to infer the branch/path taken (varies by block type)
+    # Attempt to infer branch/path taken across common block types
     $pathHint = Coalesce `
         $e.outputData?.path `
         $e.outputData?.caseLabel `
@@ -277,9 +277,7 @@ $rows = foreach ($e in $AllEvents) {
         $e.branch
 
     $err = $null
-    if ($e.errorInfo) {
-        $err = ($e.errorInfo | ConvertTo-Json -Compress -Depth 6)
-    }
+    if ($e.errorInfo) { $err = ($e.errorInfo | ConvertTo-Json -Compress -Depth 8) }
 
     [PSCustomObject]@{
         FlowName        = $flowName
@@ -287,14 +285,13 @@ $rows = foreach ($e in $AllEvents) {
         FlowVersion     = $flowVersion
         FlowInstanceId  = $flowInstanceId
         ExecutionId     = $executionId
-        EventTimeUtc    = $timestamp
+        EventTimeUtc    = $timestampUtc
         ObjectType      = $objectType
         ObjectName      = $objectName
         EventName       = $eventName
         PathTaken       = $pathHint
-        # Keep raw I/O compact for later drills
-        InputJson       = if ($e.inputData)  { $e.inputData  | ConvertTo-Json -Compress -Depth 6 } else { $null }
-        OutputJson      = if ($e.outputData) { $e.outputData | ConvertTo-Json -Compress -Depth 6 } else { $null }
+        InputJson       = if ($e.inputData)  { $e.inputData  | ConvertTo-Json -Compress -Depth 8 } else { $null }
+        OutputJson      = if ($e.outputData) { $e.outputData | ConvertTo-Json -Compress -Depth 8 } else { $null }
         ErrorJson       = $err
     }
 }
