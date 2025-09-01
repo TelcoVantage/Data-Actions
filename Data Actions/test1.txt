@@ -1,0 +1,277 @@
+<# 
+  Agent Performance (Daily) Export - Genesys Cloud
+  Author: you + ChatGPT
+  What it does:
+    - Auth via Client Credentials (no modules)
+    - Queries /analytics/users/aggregates/query for last 365 full days (Sydney)
+    - Granularity P1D; mediaType=voice
+    - Outputs daily CSV: "Agent Perofrmance DDMMYYYY.csv" in current folder
+
+  Fill in CLIENT_ID and CLIENT_SECRET below.
+#>
+
+# ====== CONFIG ======
+$CLIENT_ID     = "YOUR_CLIENT_ID_HERE"
+$CLIENT_SECRET = "YOUR_CLIENT_SECRET_HERE"
+$REGION        = "mypurecloud.com.au"           # e.g. mypurecloud.com.au
+$IANA_TZ       = "Australia/Sydney"             # used by Analytics for day boundaries
+$WINDOWS_TZ    = "AUS Eastern Standard Time"    # Windows time zone ID for Sydney
+$PAGE_SIZE     = 100
+
+# ====== HELPER: Basic checks ======
+if ([string]::IsNullOrWhiteSpace($CLIENT_ID) -or [string]::IsNullOrWhiteSpace($CLIENT_SECRET)) {
+  Write-Error "Please set CLIENT_ID and CLIENT_SECRET at the top of the script."
+  exit 1
+}
+
+# ====== HELPER: Auth ======
+function Get-GCAuthToken {
+  param([string]$Region,[string]$ClientId,[string]$ClientSecret)
+
+  $tokenUrl = "https://login.$Region/oauth/token"
+  $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$ClientId`:$ClientSecret"))
+
+  $headers = @{
+    "Authorization" = "Basic $basic"
+    "Content-Type"  = "application/x-www-form-urlencoded"
+  }
+  $body = "grant_type=client_credentials"
+
+  try {
+    $resp = Invoke-RestMethod -Method POST -Uri $tokenUrl -Headers $headers -Body $body -ErrorAction Stop
+    return $resp.access_token
+  } catch {
+    Write-Error "Auth failed: $($_.Exception.Message)"
+    throw
+  }
+}
+
+# ====== HELPER: Resilient API call with simple 429 retry ======
+function Invoke-GC {
+  param(
+    [string]$Method,
+    [string]$Path,        # e.g. '/api/v2/users/...' or '/api/v2/analytics/...'
+    [object]$Body,
+    [string]$Token,
+    [string]$Region
+  )
+
+  $uri = "https://api.$Region$Path"
+  $headers = @{
+    "Authorization" = "Bearer $Token"
+    "Content-Type"  = "application/json"
+  }
+
+  $maxAttempts = 5
+  for ($i=1; $i -le $maxAttempts; $i++) {
+    try {
+      if ($Method -eq "GET") {
+        return Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -ErrorAction Stop
+      } else {
+        $json = $null
+        if ($Body -ne $null) {
+          $json = ($Body | ConvertTo-Json -Depth 100)
+        }
+        return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -Body $json -ErrorAction Stop
+      }
+    } catch {
+      # Retry on 429 / transient 5xx
+      $status = $_.Exception.Response.StatusCode.Value__
+      if ($status -eq 429 -or ($status -ge 500 -and $status -lt 600)) {
+        $delay = [Math]::Pow(2, $i)  # 2,4,8,16,32
+        Write-Warning "API $status. Retry $i/$maxAttempts in $delay sec..."
+        Start-Sleep -Seconds $delay
+        continue
+      }
+      throw
+    }
+  }
+  throw "Failed after $maxAttempts attempts: $Method $Path"
+}
+
+# ====== TIME WINDOW: last 365 full days in Sydney time ======
+$tz = [System.TimeZoneInfo]::FindSystemTimeZoneById($WINDOWS_TZ)
+
+# Local now in Sydney
+$nowSydney   = [System.TimeZoneInfo]::ConvertTime([datetime]::UtcNow, [System.TimeZoneInfo]::Utc, $tz)
+$endLocal    = $nowSydney.Date                      # start of today (00:00) in Sydney
+$startLocal  = $endLocal.AddDays(-365)              # start of day 365 days ago
+
+# Convert to UTC ISO strings for interval
+$startUtc = [System.TimeZoneInfo]::ConvertTimeToUtc($startLocal, $tz)
+$endUtc   = [System.TimeZoneInfo]::ConvertTimeToUtc($endLocal, $tz)
+
+$interval = "{0}/{1}" -f $startUtc.ToString("o"), $endUtc.ToString("o")
+
+# ====== AUTH ======
+$token = Get-GCAuthToken -Region $REGION -ClientId $CLIENT_ID -ClientSecret $CLIENT_SECRET
+
+# ====== ANALYTICS QUERY BODY (with fallback if certain metrics are not allowed) ======
+$primaryMetrics  = @("nAnswered","nTransferred","tTalk","tHeld","tAcw","tHandle","nHandled","nHeld")
+$fallbackMetrics = @("nAnswered","nTransferred","tTalk","tHeld","tAcw","tHandle")
+
+function Get-AnalyticsPage {
+  param(
+    [int]$PageNumber,
+    [string[]]$Metrics
+  )
+  $body = [ordered]@{
+    interval    = $interval
+    timeZone    = $IANA_TZ
+    granularity = "P1D"
+    filter      = @{
+      type       = "and"
+      predicates = @(@{ dimension = "mediaType"; operator = "matches"; value = "voice" })
+    }
+    groupBy     = @("userId","userName","divisionId","divisionName")
+    metrics     = $Metrics
+    paging      = @{ pageSize = $PAGE_SIZE; pageNumber = $PageNumber }
+  }
+  return Invoke-GC -Method POST -Path "/api/v2/analytics/users/aggregates/query" -Body $body -Token $token -Region $REGION
+}
+
+# Try primary metrics first; if API rejects, fall back
+$resultsAll = @()
+$page = 1
+$metricsInUse = $primaryMetrics
+try {
+  do {
+    $resp = Get-AnalyticsPage -PageNumber $page -Metrics $metricsInUse
+    if ($resp.results) { $resultsAll += $resp.results }
+    $pageCount = $resp.pageCount
+    if (-not $pageCount) { break }  # some tenants don’t return pageCount
+    $page++
+  } while ($page -le $pageCount)
+} catch {
+  Write-Warning "Primary metric set failed (likely unsupported metric like nHandled/nHeld). Falling back..."
+  $resultsAll = @()
+  $page = 1
+  $metricsInUse = $fallbackMetrics
+  do {
+    $resp = Get-AnalyticsPage -PageNumber $page -Metrics $metricsInUse
+    if ($resp.results) { $resultsAll += $resp.results }
+    $pageCount = $resp.pageCount
+    if (-not $pageCount) { break }
+    $page++
+  } while ($page -le $pageCount)
+}
+
+# ====== Manager (Report To) cache ======
+$ManagerCache = @{}
+function Get-ManagerName {
+  param([string]$UserId)
+
+  if ($ManagerCache.ContainsKey($UserId)) { return $ManagerCache[$UserId] }
+
+  try {
+    $u = Invoke-GC -Method GET -Path "/api/v2/users/$UserId?expand=manager" -Body $null -Token $token -Region $REGION
+    $mgr = $null
+    if ($u.manager -and $u.manager.name) { $mgr = $u.manager.name }
+    if (-not $mgr) { $mgr = "" }
+    $ManagerCache[$UserId] = $mgr
+    return $mgr
+  } catch {
+    Write-Warning "Failed to fetch manager for $UserId: $($_.Exception.Message)"
+    $ManagerCache[$UserId] = ""
+    return ""
+  }
+}
+
+# ====== Metric helpers ======
+function Get-MetricValue {
+  param($metricArray, [string]$name)
+  $m = $metricArray | Where-Object { $_.metric -eq $name }
+  if (-not $m) { return 0 }
+  # Prefer 'sum' for durations; for counts, many tenants put the value into 'count'
+  $sum   = $m.stats.sum
+  $count = $m.stats.count
+  if ($sum -ne $null -and $sum -ne 0) { return [double]$sum }
+  if ($count -ne $null) { return [double]$count }
+  return 0
+}
+
+# ====== Build rows ======
+$rows = New-Object System.Collections.Generic.List[object]
+
+foreach ($r in $resultsAll) {
+  # Parse dimensions
+  $g = @{}
+  foreach ($kv in $r.groupedBy) { $g[$kv.dimension] = $kv.value }
+
+  $agentId      = $g["userId"]
+  $agentName    = $g["userName"]
+  $divisionId   = $g["divisionId"]
+  $divisionName = $g["divisionName"]
+
+  # Interval start (this is the day's start in ISO). Format to DD/MM/YYYY
+  $sliceStart = $null
+  try {
+    $sliceStart = [DateTimeOffset]::Parse(($r.interval -split '/')[0])
+  } catch {
+    $sliceStart = [DateTimeOffset]::UtcNow
+  }
+  # Convert to Sydney-local date string for display
+  $sliceLocal = [System.TimeZoneInfo]::ConvertTime($sliceStart, [System.TimeZoneInfo]::FindSystemTimeZoneById($WINDOWS_TZ))
+  $dateDisplay = $sliceLocal.ToString("dd/MM/yyyy")
+
+  # Metrics
+  $answered      = [int](Get-MetricValue $r.metrics "nAnswered")
+  $transferred   = [int](Get-MetricValue $r.metrics "nTransferred")
+  $tHandleMs     = [double](Get-MetricValue $r.metrics "tHandle")
+  $tTalkMs       = [double](Get-MetricValue $r.metrics "tTalk")
+  $tHeldMs       = [double](Get-MetricValue $r.metrics "tHeld")
+  $tAcwMs        = [double](Get-MetricValue $r.metrics "tAcw")
+
+  # Optional counts
+  $nHandledTry   = [int](Get-MetricValue $r.metrics "nHandled")
+  $nHeldTry      = [int](Get-MetricValue $r.metrics "nHeld")
+
+  $handledCount = if ($nHandledTry -gt 0) { $nHandledTry } else { $answered }
+  $heldCount    = if ($nHeldTry -gt 0) { $nHeldTry } else { 0 }
+
+  # Totals to seconds
+  $totalHandleSec = [math]::Round($tHandleMs / 1000.0, 0)
+  $totalTalkSec   = [math]::Round($tTalkMs   / 1000.0, 0)
+  $totalHoldSec   = [math]::Round($tHeldMs   / 1000.0, 0)
+  $totalAcwSec    = [math]::Round($tAcwMs    / 1000.0, 0)
+
+  # Averages (per answered to match typical Agent Performance logic)
+  if ($answered -gt 0) {
+    $avgHandleSec = [math]::Round(($tHandleMs / 1000.0) / $answered, 2)
+    $avgTalkSec   = [math]::Round(($tTalkMs   / 1000.0) / $answered, 2)
+    $avgHoldSec   = [math]::Round(($tHeldMs   / 1000.0) / $answered, 2)
+    $avgAcwSec    = [math]::Round(($tAcwMs    / 1000.0) / $answered, 2)
+  } else {
+    $avgHandleSec = 0; $avgTalkSec = 0; $avgHoldSec = 0; $avgAcwSec = 0
+  }
+
+  # Manager (Report To) – cache per agent
+  $reportTo = Get-ManagerName -UserId $agentId
+
+  $obj = [pscustomobject]@{
+    "Date"            = $dateDisplay
+    "Agent ID"        = $agentId
+    "Agent Name"      = $agentName
+    "Division ID"     = $divisionId
+    "Division Name"   = $divisionName
+    "Report To"       = $reportTo
+    "Answered"        = $answered
+    "Handle"          = $handledCount
+    "average handle"  = $avgHandleSec
+    "average talk"    = $avgTalkSec
+    "average hold"    = $avgHoldSec
+    "average acw"     = $avgAcwSec
+    "held"            = $heldCount
+    "transfered"      = $transferred
+    "Total handle"    = $totalHandleSec
+  }
+
+  $rows.Add($obj) | Out-Null
+}
+
+# ====== Export ======
+$stamp = (Get-Date -Format "ddMMyyyy")
+$filename = "Agent Perofrmance $stamp.csv"  # exactly as requested
+$rows | Sort-Object Date, 'Agent Name' | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $filename
+
+Write-Host "Done. Exported $($rows.Count) rows to `"$filename`" in $(Get-Location)."
