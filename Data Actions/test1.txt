@@ -1,253 +1,85 @@
-<# 
-  Agent Conversations Daily Export (Conversations Aggregates)
-  - Auth: Client Credentials (no modules required)
-  - Users: /api/v2/users (paginated)
-  - Data:  /api/v2/analytics/conversations/aggregates/query
-  - Grouping: userId, P1D (Australia/Sydney)
-  - Output: "Agent Conversations Daily DDMMYYYY.csv" in current folder
-#>
+# --- Requirements ---
+# PowerShell 5.1+ or 7+, Teams Admin/Global Admin (to see all teams)
+# Module: MicrosoftTeams (preview recommended for Get-TeamChannelUser)
 
-# ====== CONFIG ======
-$CLIENT_ID     = "YOUR_CLIENT_ID_HERE"
-$CLIENT_SECRET = "YOUR_CLIENT_SECRET_HERE"
-$REGION        = "mypurecloud.com.au"           # e.g., mypurecloud.com.au
-$IANA_TZ       = "Australia/Sydney"
-$WINDOWS_TZ    = "AUS Eastern Standard Time"
-$DAYS_BACK     = 365                            # last N full days
-$PAGE_SIZE     = 100
-$MEDIA_TYPE    = "voice"                        # change to "chat","email","callback","message" or remove filter
-
-# ====== BASIC CHECK ======
-if ([string]::IsNullOrWhiteSpace($CLIENT_ID) -or [string]::IsNullOrWhiteSpace($CLIENT_SECRET)) {
-  Write-Error "Please set CLIENT_ID and CLIENT_SECRET at the top of the script."
-  exit 1
+# Install/upgrade per-user (no admin rights needed)
+if (-not (Get-Module -ListAvailable MicrosoftTeams)) {
+  Install-Module MicrosoftTeams -Scope CurrentUser -Force -AllowClobber
 }
+Import-Module MicrosoftTeams
 
-# ====== AUTH ======
-function Get-GCAuthToken {
-  param([string]$Region,[string]$ClientId,[string]$ClientSecret)
-  $tokenUrl = "https://login.$Region/oauth/token"
-  $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$ClientId`:$ClientSecret"))
-  $headers = @{
-    "Authorization" = "Basic $basic"
-    "Content-Type"  = "application/x-www-form-urlencoded"
-  }
-  $body = "grant_type=client_credentials"
+# Optional: ensure preview (needed for Get-TeamChannelUser in some tenants)
+$hasChanUser = Get-Command Get-TeamChannelUser -ErrorAction SilentlyContinue
+if (-not $hasChanUser) {
   try {
-    (Invoke-RestMethod -Method POST -Uri $tokenUrl -Headers $headers -Body $body -ErrorAction Stop).access_token
-  } catch {
-    Write-Error ("Auth failed: {0}" -f $_.Exception.Message)
-    throw
-  }
+    Install-Module MicrosoftTeams -Scope CurrentUser -Force -AllowPrerelease
+    Import-Module MicrosoftTeams -Force
+    $hasChanUser = Get-Command Get-TeamChannelUser -ErrorAction SilentlyContinue
+  } catch { Write-Warning "Couldn't install preview module: $($_.Exception.Message)" }
 }
 
-# ====== RESILIENT API INVOKER ======
-function Invoke-GC {
-  param(
-    [string]$Method,
-    [string]$Path,   # '/api/v2/...'
-    [object]$Body,
-    [string]$Token,
-    [string]$Region
-  )
-  $uri = "https://api.$Region$Path"
-  $headers = @{ "Authorization" = "Bearer $Token"; "Content-Type" = "application/json" }
+# Sign in
+Connect-MicrosoftTeams | Out-Null
 
-  $maxAttempts = 5
-  for ($i=1; $i -le $maxAttempts; $i++) {
-    try {
-      if ($Method -eq "GET") {
-        return Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -ErrorAction Stop
-      } else {
-        $json = if ($Body -ne $null) { $Body | ConvertTo-Json -Depth 100 } else { $null }
-        return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -Body $json -ErrorAction Stop
-      }
-    } catch {
-      $resp = $_.Exception.Response
-      $status = $null
-      if ($resp -and $resp.StatusCode) { $status = $resp.StatusCode.value__ }
-      if ($status -eq 429 -or ($status -ge 500 -and $status -lt 600)) {
-        $delay = [Math]::Pow(2, $i)  # 2,4,8,16,32
-        Write-Warning ("API {0}. Retry {1}/{2} in {3}s..." -f $status, $i, $maxAttempts, $delay)
-        Start-Sleep -Seconds $delay
-        continue
-      }
-      # Bubble up other errors
-      throw
-    }
-  }
-  throw "Failed after $maxAttempts attempts: $Method $Path"
-}
+# Output file (AU-friendly stamp)
+$stamp = (Get-Date).ToString('ddMMyyyy_HHmm')
+$outFile = Join-Path $env:USERPROFILE "Downloads\TeamsChannelsOwners_$stamp.csv"
 
-# ====== TIME WINDOW (last N full days in Sydney) ======
-$tz = [System.TimeZoneInfo]::FindSystemTimeZoneById($WINDOWS_TZ)
-$nowSydney   = [System.TimeZoneInfo]::ConvertTime([datetime]::UtcNow, [System.TimeZoneInfo]::Utc, $tz)
-$endLocal    = $nowSydney.Date                   # start of today (00:00) Sydney
-$startLocal  = $endLocal.AddDays(-1 * $DAYS_BACK)
-$startUtc    = [System.TimeZoneInfo]::ConvertTimeToUtc($startLocal, $tz)
-$endUtc      = [System.TimeZoneInfo]::ConvertTimeToUtc($endLocal,   $tz)
-$interval    = "{0}/{1}" -f $startUtc.ToString("o"), $endUtc.ToString("o")
-
-# ====== AUTH NOW ======
-$token = Get-GCAuthToken -Region $REGION -ClientId $CLIENT_ID -ClientSecret $CLIENT_SECRET
-
-# ====== GET ALL USERS (paginated) ======
-Write-Host "Fetching all users..."
-$AllUsers = @()
-$page = 1
-do {
-  $resp = Invoke-GC -Method GET -Path "/api/v2/users?pageNumber=$page&pageSize=$PAGE_SIZE" -Body $null -Token $token -Region $REGION
-  if ($resp.entities) { $AllUsers += $resp.entities }
-  $pageCount = $resp.pageCount
-  $page++
-} while ($resp.entities -and $resp.entities.Count -gt 0 -and $pageCount -and $page -le $pageCount)
-
-if (-not $AllUsers -or $AllUsers.Count -eq 0) {
-  Write-Warning "No users returned."
-}
-
-# Build quick maps for user lookup
-$UserNameById = @{}
-foreach ($u in $AllUsers) {
-  $uid = $u.id
-  $uname = if ($u.name) { $u.name } elseif ($u.username) { $u.username } else { $u.id }
-  if ($uid) { $UserNameById[$uid] = $uname }
-}
-
-# ====== ANALYTICS (Conversations Aggregates) ======
-# Primary metric set (common across tenants). If rejected, we'll fallback.
-$primaryMetrics  = @("nOffered","nAnswered","nTransferred","tHandle","tTalk","tHeld","tAcw")
-$fallbackMetrics = @("nOffered","nTransferred","tHandle","tTalk","tHeld","tAcw")  # drop nAnswered if unsupported
-
-function Get-ConvoAggPage {
-  param(
-    [int]$PageNumber,
-    [string[]]$Metrics
-  )
-  # Filter to mediaType; Segment to 'agent' to count only agent segments
-  $body = [ordered]@{
-    interval     = $interval
-    timeZone     = $IANA_TZ
-    granularity  = "P1D"
-    filter       = @{
-      type       = "and"
-      predicates = @(@{ dimension = "mediaType"; operator = "matches"; value = $MEDIA_TYPE })
-    }
-    segmentFilters = @(
-      @{
-        type = "and"
-        predicates = @(@{ dimension = "segmentType"; operator = "matches"; value = "agent" })
-      }
-    )
-    groupBy      = @("userId")
-    metrics      = $Metrics
-    paging       = @{ pageSize = $PAGE_SIZE; pageNumber = $PageNumber }
-  }
-  Invoke-GC -Method POST -Path "/api/v2/analytics/conversations/aggregates/query" -Body $body -Token $token -Region $REGION
-}
-
-Write-Host "Querying conversations aggregates (P1D) ..."
-$AggResults = @()
-$page = 1
-$metricsInUse = $primaryMetrics
-
-try {
-  do {
-    $resp = Get-ConvoAggPage -PageNumber $page -Metrics $metricsInUse
-    if ($resp.results) { $AggResults += $resp.results }
-    $pageCount = $resp.pageCount
-    if (-not $pageCount) { break }
-    $page++
-  } while ($page -le $pageCount)
-} catch {
-  Write-Warning "Primary metric set failed; falling back to a reduced set."
-  $AggResults = @()
-  $page = 1
-  $metricsInUse = $fallbackMetrics
-  do {
-    $resp = Get-ConvoAggPage -PageNumber $page -Metrics $metricsInUse
-    if ($resp.results) { $AggResults += $resp.results }
-    $pageCount = $resp.pageCount
-    if (-not $pageCount) { break }
-    $page++
-  } while ($page -le $pageCount)
-}
-
-# ====== HELPERS ======
-function Get-MetricVal {
-  param($metricArray, [string]$name)
-  $m = $metricArray | Where-Object { $_.metric -eq $name }
-  if (-not $m) { return 0 }
-  $sum   = $m.stats.sum
-  $count = $m.stats.count
-  if ($sum -ne $null -and $sum -ne 0) { return [double]$sum }
-  if ($count -ne $null) { return [double]$count }
-  0
-}
-
-# ====== BUILD ROWS DAY-BY-DAY ======
-$WINDOWS_TZ_OBJ = [System.TimeZoneInfo]::FindSystemTimeZoneById($WINDOWS_TZ)
 $rows = New-Object System.Collections.Generic.List[object]
 
-foreach ($r in $AggResults) {
-  # Dimensions
-  $dims = @{}
-  foreach ($kv in $r.groupedBy) { $dims[$kv.dimension] = $kv.value }
-  $userId = $dims["userId"]
+$teams = Get-Team -NumberOfThreads 10   # requires admin role to enumerate org-wide
+$i = 0
+foreach ($t in $teams) {
+  $i++
+  Write-Progress -Activity "Teams" -Status "$i / $($teams.Count): $($t.DisplayName)" -PercentComplete ($i/$teams.Count*100)
 
-  # Date slice (interval start)
-  $sliceStart = $null
-  try { $sliceStart = [DateTimeOffset]::Parse(($r.interval -split '/')[0]) } catch { $sliceStart = [DateTimeOffset]::UtcNow }
-  $sliceLocal = [System.TimeZoneInfo]::ConvertTime($sliceStart, $WINDOWS_TZ_OBJ)
-  $dateDisplay = $sliceLocal.ToString("dd/MM/yyyy")
+  # Team-level owners
+  $teamOwners = @()
+  try { $teamOwners = Get-TeamUser -GroupId $t.GroupId -Role Owner } catch {}
+  $teamOwnerNames = ($teamOwners | ForEach-Object Name) -join '; '
+  $teamOwnerUPNs  = ($teamOwners | ForEach-Object User) -join '; '
 
-  # Map userName
-  $userName = if ($UserNameById.ContainsKey($userId)) { $UserNameById[$userId] } else { $userId }
+  # Channels
+  $channels = @()
+  try { $channels = Get-TeamChannel -GroupId $t.GroupId } catch {}
 
-  # Metrics
-  $nOffered     = [int](Get-MetricVal $r.metrics "nOffered")
-  $nAnswered    = [int](Get-MetricVal $r.metrics "nAnswered")        # may be 0 if not returned
-  $nTransferred = [int](Get-MetricVal $r.metrics "nTransferred")
+  foreach ($ch in $channels) {
+    $chanOwnerNames = $null; $chanOwnerUPNs = $null; $note = $null
+    if ($ch.MembershipType -in @('Private','Shared')) {
+      if ($hasChanUser) {
+        try {
+          $owners = Get-TeamChannelUser -GroupId $t.GroupId -DisplayName $ch.DisplayName -Role Owner
+          $chanOwnerNames = ($owners | ForEach-Object Name) -join '; '
+          $chanOwnerUPNs  = ($owners | ForEach-Object User) -join '; '
+          $note = 'Channel owners (private/shared)'
+        } catch {
+          $note = 'Failed to resolve channel owners'
+        }
+      } else {
+        $note = 'Install Teams PS preview to get channel owners'
+      }
+    } else {
+      $chanOwnerNames = $teamOwnerNames
+      $chanOwnerUPNs  = $teamOwnerUPNs
+      $note = 'Standard channel → uses Team owners'
+    }
 
-  $tHandleMs    = [double](Get-MetricVal $r.metrics "tHandle")
-  $tTalkMs      = [double](Get-MetricVal $r.metrics "tTalk")
-  $tHeldMs      = [double](Get-MetricVal $r.metrics "tHeld")
-  $tAcwMs       = [double](Get-MetricVal $r.metrics "tAcw")
-
-  # Totals in seconds
-  $totalHandleSec = [math]::Round($tHandleMs / 1000.0, 0)
-  $totalTalkSec   = [math]::Round($tTalkMs   / 1000.0, 0)
-  $totalHoldSec   = [math]::Round($tHeldMs   / 1000.0, 0)
-  $totalAcwSec    = [math]::Round($tAcwMs    / 1000.0, 0)
-
-  # Averages per answered (fall back to per offered if answered is missing)
-  $den = if ($nAnswered -gt 0) { $nAnswered } elseif ($nOffered -gt 0) { $nOffered } else { 0 }
-  $avgHandleSec = if ($den -gt 0) { [math]::Round(($tHandleMs/1000.0) / $den, 2) } else { 0 }
-  $avgTalkSec   = if ($den -gt 0) { [math]::Round(($tTalkMs  /1000.0) / $den, 2) } else { 0 }
-  $avgHoldSec   = if ($den -gt 0) { [math]::Round(($tHeldMs  /1000.0) / $den, 2) } else { 0 }
-  $avgAcwSec    = if ($den -gt 0) { [math]::Round(($tAcwMs   /1000.0) / $den, 2) } else { 0 }
-
-  $rows.Add([pscustomobject]@{
-    "Date"             = $dateDisplay
-    "User ID"          = $userId
-    "User Name"        = $userName
-    "Offered"          = $nOffered
-    "Answered"         = $nAnswered
-    "Transferred"      = $nTransferred
-    "Total Handle (s)" = $totalHandleSec
-    "Total Talk (s)"   = $totalTalkSec
-    "Total Hold (s)"   = $totalHoldSec
-    "Total ACW (s)"    = $totalAcwSec
-    "Avg Handle (s)"   = $avgHandleSec
-    "Avg Talk (s)"     = $avgTalkSec
-    "Avg Hold (s)"     = $avgHoldSec
-    "Avg ACW (s)"      = $avgAcwSec
-  }) | Out-Null
+    $rows.Add([pscustomobject]@{
+      TeamName          = $t.DisplayName
+      TeamId            = $t.GroupId
+      ChannelName       = $ch.DisplayName
+      ChannelId         = $ch.Id
+      ChannelType       = $ch.MembershipType   # Standard | Private | Shared
+      TeamOwnerNames    = $teamOwnerNames
+      TeamOwnerUPNs     = $teamOwnerUPNs
+      ChannelOwnerNames = $chanOwnerNames
+      ChannelOwnerUPNs  = $chanOwnerUPNs
+      OwnerDerivation   = $note
+    })
+  }
 }
 
-# ====== EXPORT ======
-$stamp = (Get-Date -Format "ddMMyyyy")
-$filename = "Agent Conversations Daily $stamp.csv"
-$rows | Sort-Object Date, 'User Name' | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $filename
+$rows | Sort-Object TeamName, ChannelType, ChannelName |
+  Export-Csv -Path $outFile -NoTypeInformation -Encoding UTF8
 
-Write-Host ("Done. Exported {0} rows to '{1}'." -f $rows.Count, $filename)
+Write-Host "`nDone. CSV saved to: $outFile" -ForegroundColor Green
