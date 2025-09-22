@@ -1,217 +1,46 @@
-<#
-.SYNOPSIS
-    Generates a daily agent performance report from Genesys Cloud for the past year.
+You are a solutions architect specializing in Microsoft Teams Voice and advanced contact center functionalities.
 
-.DESCRIPTION
-    This script connects to the Genesys Cloud API to retrieve key performance indicators for all agents,
-    broken down day by day for the last 365 days. The results are compiled into a single CSV file.
+Context
 
-    Metrics are calculated for INBOUND VOICE interactions only.
+Our organization has a single team of senior-level agents. All agents in this team are peers and have the same level of authority. They all answer customer calls that arrive through a single Microsoft Teams Call Queue and they use the "Queues" app to manage their call-related activities.
 
-.REQUIREMENTS
-    - GenesysCloud.PowerShell module
-    - A configured Genesys Cloud OAuth Client with Client Credentials grant type.
-    - Permissions: analytics:userDetail:view, users:user:view, authorization:division:view
+Primary Goal
 
-.OUTPUTS
-    A CSV file named "Agent Performance DDMMYYYY.csv" on the user's Desktop.
-#>
+I need to enable any senior agent on this team to monitor a live call being handled by another senior agent (their peer). The capability must be reciprocal, meaning if Agent A can monitor Agent B, Agent B must also be able to monitor Agent A.
 
-#region CONFIGURATION
-# ----------------------------------------------------------------------------------
-# UPDATE THE FOUR VARIABLES BELOW
-# ----------------------------------------------------------------------------------
+Specific Functional Requirements
 
-# 1. Your Genesys Cloud region. Examples:
-#    "mypurecloud.com" (US East), "mypurecloud.ie" (EU West), "mypurecloud.com.au" (APAC Sydney)
-$gcEnvironment = "mypurecloud.com.au"
+The desired feature is live call monitoring, often referred to as "Call Control" or "Supervisory" features in a contact center. Specifically, when one agent is on an active call from the queue, another agent must be able to:
 
-# 2. Your OAuth Client ID
-$gcClientID = "YOUR_CLIENT_ID_HERE"
-
-# 3. Your OAuth Client Secret
-$gcClientSecret = "YOUR_CLIENT_SECRET_HERE"
-
-# 4. Set the number of days to look back (e.g., 365 for one year)
-$daysToLookBack = 365
-
-#endregion
-
-#region SCRIPT BODY (No changes needed below this line)
-
-# --- Initial Setup ---
-Write-Host "Starting Agent Performance Report Script..." -ForegroundColor Cyan
-
-# Import the module and set the environment
-try {
-    Import-Module GenesysCloud.PowerShell -ErrorAction Stop
-    Set-GCEnvironment -Environment $gcEnvironment
-}
-catch {
-    Write-Host "Error: The GenesysCloud.PowerShell module is not installed or could not be imported." -ForegroundColor Red
-    Write-Host "Please run: Install-Module -Name GenesysCloud.PowerShell -Scope CurrentUser" -ForegroundColor Yellow
-    return
-}
-
-# Authenticate to Genesys Cloud
-try {
-    Get-GCToken -ClientId $gcClientID -ClientSecret $gcClientSecret | Out-Null
-    Write-Host "Successfully authenticated to Genesys Cloud." -ForegroundColor Green
-}
-catch {
-    Write-Host "Error: Authentication failed. Please check your Region, Client ID, and Client Secret." -ForegroundColor Red
-    return
-}
-
-# --- Prepare Output File ---
-$reportDate = (Get-Date).ToString("ddMMyyyy")
-$desktopPath = [System.Environment]::GetFolderPath('Desktop')
-$outputFile = Join-Path -Path $desktopPath -ChildPath "Agent Performance $reportDate.csv"
-Write-Host "Report will be saved to: $outputFile"
-
-# --- Pre-load Data for Efficiency ---
-Write-Host "Caching user, division, and manager data... This may take a moment."
-
-try {
-    # Cache all divisions (ID -> Name)
-    $divisionLookup = @{}
-    Get-GCDivisions -All | ForEach-Object { $divisionLookup[$_.id] = $_.name }
-
-    # Cache all users (ID -> User Object)
-    $users = Get-GCUsers -State active -All # Fetches only active users to reduce overhead
-    $userLookup = @{}
-    $users | ForEach-Object { $userLookup[$_.id] = $_ }
-
-    # Create a lookup for manager names (UserID -> Manager Name)
-    $managerLookup = @{}
-    foreach ($user in $users) {
-        $managerName = "N/A"
-        if ($null -ne $user.reportsTo) {
-            $managerId = ($user.reportsTo -split '/')[-1]
-            if ($userLookup.ContainsKey($managerId)) {
-                $managerName = $userLookup[$managerId].name
-            }
-        }
-        $managerLookup[$user.id] = $managerName
-    }
-    Write-Host "Cached $($users.Count) active users and $($divisionLookup.Count) divisions." -ForegroundColor Green
-}
-catch {
-    Write-Host "Error caching initial data: $($_.Exception.Message)" -ForegroundColor Red
-    return
-}
+1. Listen In: Silently join the call to hear both the agent and the customer without either of them knowing.
 
 
-# --- Main Data Fetching Loop ---
-$allResults = [System.Collections.Generic.List[PSObject]]::new()
-$startDate = (Get-Date).AddDays(-$daysToLookBack).Date
-$endDate = (Get-Date).AddDays(-1).Date # Data up to yesterday
+2. Whisper Coach: Speak directly to their fellow agent without the customer hearing, in order to provide live guidance.
 
-Write-Host "Fetching daily metrics from $startDate to $endDate..." -ForegroundColor Cyan
 
-for ($day = $startDate; $day -le $endDate; $day = $day.AddDays(1)) {
-    $dayString = $day.ToString("yyyy-MM-dd")
-    Write-Host "Processing data for: $dayString"
+3. Barge In: Join the call fully, enabling a three-way conversation between both agents and the customer.
 
-    # Genesys Cloud API requires the interval in ISO-8601 format
-    $interval = "$($day.ToString('yyyy-MM-ddTHH:mm:ss.fff'))Z/$($day.AddDays(1).ToString('yyyy-MM-ddTHH:mm:ss.fff'))Z"
 
-    # Construct the analytics query body
-    $queryBody = @{
-        interval   = $interval
-        order      = "asc"
-        orderBy    = "userId"
-        paging     = @{
-            pageSize   = 100
-            pageNumber = 1
-        }
-        userFilters = @(
-            @{
-                type  = "or"
-                predicates = @(
-                    # Only include users we cached earlier
-                    @{
-                        type = "dimension"
-                        dimension = "userId"
-                        operator = "matches"
-                        value = $users.id
-                    }
-                )
-            }
-        )
-        metrics    = @(
-            "tAnswer",
-            "tHandle",
-            "tTalk",
-            "tHeld",
-            "tAcw",
-            "tTransfer"
-        )
-    } | ConvertTo-Json -Depth 10
 
-    # API call to get the data for the day
-    try {
-        $apiPath = "/api/v2/analytics/users/details/query"
-        # Invoke-GCRequestAll automatically handles pagination
-        $dailyData = Invoke-GCRequestAll -Method POST -Path $apiPath -Body $queryBody
+This functionality should ideally be accessible from within the Microsoft Teams client, perhaps through the "Queues" app or a similar interface.
 
-        if ($null -ne $dailyData.userDetails) {
-            foreach ($userDetail in $dailyData.userDetails) {
-                $userId = $userDetail.userId
-                $userObject = $userLookup[$userId]
+Your Task
 
-                # Skip if the user is no longer in our cached list
-                if ($null -eq $userObject) { continue }
+Please provide a detailed technical guide to achieve this peer-to-peer live call monitoring. Structure your response to answer the following:
 
-                $primaryMetrics = $userDetail.primaryPresence | Select-Object -First 1
+1. Native Feature Analysis: Is live call monitoring (Listen, Whisper, Barge) a standard feature available in Microsoft Teams?
 
-                # Extract stats, defaulting to 0 if not present
-                $stats = @{}
-                $userDetail.metrics | ForEach-Object { $stats[$_.metric] = $_.stats.sum }
-                $tAnswer = [long]($stats['tAnswer'] ?? 0)
-                $tHandle = [long]($stats['tHandle'] ?? 0)
-                $tTalk = [long]($stats['tTalk'] ?? 0)
-                $tHeld = [long]($stats['tHeld'] ?? 0)
-                $tAcw = [long]($stats['tAcw'] ?? 0)
-                $tTransfer = [long]($stats['tTransfer'] ?? 0)
-                
-                # Only create a record if the agent actually answered a call
-                if ($tAnswer -gt 0) {
-                    $record = [PSCustomObject]@{
-                        "Date"            = $day.ToString("dd/MM/yyyy")
-                        "Agent ID"        = $userId
-                        "Agent Name"      = $userObject.name
-                        "Division ID"     = $userObject.division.id
-                        "Division Name"   = $divisionLookup[$userObject.division.id] ?? "N/A"
-                        "Report To"       = $managerLookup[$userId]
-                        "Answered"        = $tAnswer
-                        "Handle"          = [math]::Round($tHandle / 1000, 2) # Convert ms to seconds
-                        "Average Handle"  = [math]::Round($tHandle / $tAnswer / 1000, 2) # Convert ms to seconds
-                        "Average Talk"    = [math]::Round($tTalk / $tAnswer / 1000, 2) # Convert ms to seconds
-                        "Average Hold"    = [math]::Round($tHeld / $tAnswer / 1000, 2) # Convert ms to seconds
-                        "Average ACW"     = [math]::Round($tAcw / $tAnswer / 1000, 2) # Convert ms to seconds
-                        "Held"            = [math]::Round($tHeld / 1000, 2) # Convert ms to seconds
-                        "Transferred"     = $tTransfer
-                        "Total Handle"    = [math]::Round($tHandle / 1000, 2) # This is the same as Handle
-                    }
-                    $allResults.Add($record)
-                }
-            }
-        }
-    }
-    catch {
-        Write-Host "Error fetching data for $dayString: $($_.Exception.Message)" -ForegroundColor Red
-    }
-}
 
-# --- Export to CSV ---
-if ($allResults.Count -gt 0) {
-    Write-Host "Exporting $($allResults.Count) records to CSV..."
-    $allResults | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
-    Write-Host "✅ Script finished successfully! Report is ready." -ForegroundColor Green
-    Write-Host "Location: $outputFile"
-}
-else {
-    Write-Host "⚠️ Script finished, but no data was found for the specified period." -ForegroundColor Yellow
-}
-#endregion
+2. Licensing Requirements: If it is a native feature, what specific Microsoft licenses are required for each agent to enable this? (e.g., Teams Phone Standard, Teams Premium, Teams Rooms Pro, etc.).
+
+
+3. Configuration Guide: Provide a step-by-step process for an administrator to configure this in the Teams Admin Center. Crucially, explain how to set up the permissions for a peer-to-peer model, rather than a traditional, rigid supervisor-to-agent hierarchy.
+
+
+4. End-User Workflow: Describe exactly how an agent would initiate a monitoring session. Where in the Teams client do they go? What buttons do they click to Listen, Whisper, or Barge on a teammate's active call?
+
+
+5. Limitations & Alternatives: If this exact peer-to-peer model is not natively possible, clearly state the limitations. Then, propose the best alternative solutions, such as certified third-party CCaaS (Contact Center as a Service) providers that integrate directly into Microsoft Teams to deliver this functionality.
+
+
+
