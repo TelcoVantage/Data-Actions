@@ -1,282 +1,163 @@
-<# 
-    Agent Performance (day-by-day) CSV for last 365 days – Genesys Cloud (Voice)
-    - No external modules required. Pure Invoke-RestMethod.
-    - Outputs: "Agent Performance ddMMyyyy.csv" in the current folder.
-    - Region default: mypurecloud.com.au (Sydney orgs)
-#>
+# =====================================================================================
+# SCRIPT CONFIGURATION - FILL IN YOUR DETAILS HERE
+# =====================================================================================
 
-[CmdletBinding()]
-param(
-    [int]$DaysBack = 365,                   # Full days to export (ending yesterday)
-    [string]$Region = "mypurecloud.com.au", # e.g., mypurecloud.com.au, mypurecloud.com, etc.
-    [string]$TimeZone = "Australia/Sydney", # Used for interval bucketing
-    [int]$UserBatchSize = 50                # User IDs per analytics request (keeps payloads reasonable)
-)
+# 1. Your Genesys Cloud Client ID from the OAuth Client you created
+$clientId = "YOUR_CLIENT_ID"
 
-# -----------------------------
-# === EDIT ME (Your OAuth) ===
-# -----------------------------
-$CLIENT_ID     = "<PUT_CLIENT_ID_HERE>"
-$CLIENT_SECRET = "<PUT_CLIENT_SECRET_HERE>"
-# -----------------------------
+# 2. Your Genesys Cloud Client Secret from the OAuth Client you created
+$clientSecret = "YOUR_CLIENT_SECRET"
 
-# Fail fast if creds missing
-if (-not $CLIENT_ID -or -not $CLIENT_SECRET -or $CLIENT_ID -like "<PUT_*>" -or $CLIENT_SECRET -like "<PUT_*>") {
-    throw "Please set CLIENT_ID and CLIENT_SECRET near the top of the script."
+# 3. Your Genesys Cloud Region's API Host.
+#    Examples:
+#    - North America (East): api.mypurecloud.com
+#    - Australia (Sydney):   api.mypurecloud.com.au
+#    - EU (Frankfurt):       api.mypurecloud.de
+#    Find your region here: https://developer.genesys.cloud/platform/api/
+$genesysCloudRegion = "api.mypurecloud.com.au"
+
+# 4. The ID of the Business Unit you want to query
+$businessUnitId = "YOUR_BUSINESS_UNIT_ID"
+
+# 5. The ID of the Management Unit containing the agents you want to query
+$managementUnitId = "YOUR_MANAGEMENT_UNIT_ID"
+
+# 6. The full path where you want to save the final CSV file.
+#    The script will automatically add the date to the filename.
+$csvExportPath = "C:\Temp\AgentSchedules.csv"
+
+# =====================================================================================
+# SCRIPT LOGIC - NO NEED TO EDIT BELOW THIS LINE
+# =====================================================================================
+
+# --- Function to Write Log Messages ---
+function Write-Log {
+    param ([string]$Message, [string]$Color = "White")
+    Write-Host ("[{0}] - {1}" -f (Get-Date -Format "HH:mm:ss"), $Message) -ForegroundColor $Color
 }
 
-# TLS and region endpoints
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$LoginUrl = "https://login.$Region/oauth/token"
-$ApiBase  = "https://api.$Region"
+# --- 1. Calculate Date Range for "Yesterday" ---
+$today = (Get-Date).Date
+$yesterdayStart = $today.AddDays(-1)
+$yesterdayEnd = $today.AddSeconds(-1)
 
-function Get-AccessToken {
-    $pair   = "$CLIENT_ID`:$CLIENT_SECRET"
-    $b64    = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
-    $headers = @{ Authorization = "Basic $b64" }
-    $body    = @{ grant_type = "client_credentials" }
+# Convert dates to ISO 8601 format required by the API
+$startDateIso = $yesterdayStart.ToString("u").Replace(" ", "T")
+$endDateIso = $yesterdayEnd.ToString("u").Replace(" ", "T")
 
-    $resp = Invoke-RestMethod -Method Post -Uri $LoginUrl -Headers $headers -Body $body -ContentType "application/x-www-form-urlencoded"
-    return $resp.access_token
+Write-Log "Fetching schedules for the period: $startDateIso to $endDateIso" "Cyan"
+
+# --- 2. Authenticate and Get Access Token ---
+Write-Log "Authenticating with Genesys Cloud..."
+$authUrl = "https://login.$genesysCloudRegion/oauth/token"
+$authBody = @{
+    grant_type = "client_credentials"
+}
+$authHeader = @{
+    "Authorization" = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${clientId}:${clientSecret}"))
+    "Content-Type"  = "application/x-www-form-urlencoded"
 }
 
-function Invoke-GC {
-    param(
-        [string]$Method,
-        [string]$Path,
-        [hashtable]$Headers,
-        [object]$Body = $null
-    )
-    $url = "$ApiBase$Path"
+try {
+    $tokenResponse = Invoke-RestMethod -Uri $authUrl -Method Post -Body $authBody -Headers $authHeader
+    $accessToken = $tokenResponse.access_token
+    Write-Log "Successfully authenticated." "Green"
+}
+catch {
+    Write-Log "Error authenticating. Check your Client ID, Secret, and Region." "Red"
+    Write-Log $_.Exception.Message "Red"
+    exit
+}
 
-    for ($attempt = 1; $attempt -le 5; $attempt++) {
-        try {
-            if ($Body) {
-                return Invoke-RestMethod -Method $Method -Uri $url -Headers $Headers -Body ($Body | ConvertTo-Json -Depth 100) -ContentType "application/json"
-            } else {
-                return Invoke-RestMethod -Method $Method -Uri $url -Headers $Headers
-            }
-        } catch {
-            $resp = $_.Exception.Response
-            if ($resp -and $resp.StatusCode -eq 429) {
-                # Backoff on rate limit
-                Start-Sleep -Seconds ([Math]::Min(30, 2 * $attempt))
-            } else {
-                throw
-            }
+# --- 3. Prepare API Headers ---
+$apiHeaders = @{
+    "Authorization" = "Bearer $accessToken"
+    "Content-Type"  = "application/json"
+}
+
+# --- 4. Get Activity Code Mappings ---
+Write-Log "Fetching activity codes for business unit..."
+$activityCodeUrl = "https://$genesysCloudRegion/api/v2/workforce/management/businessunits/$businessUnitId/activitycodes"
+$activityCodeResponse = Invoke-RestMethod -Uri $activityCodeUrl -Method Get -Headers $apiHeaders
+
+# Create a lookup table (hashtable) for faster access
+$activityCodeMap = @{}
+$activityCodeResponse.activityCodes.ForEach({ $activityCodeMap[$_.id] = $_.name })
+Write-Log "Found $($activityCodeMap.Count) activity codes."
+
+# --- 5. Get Users from the Management Unit ---
+Write-Log "Fetching users from management unit..."
+$usersUrl = "https://$genesysCloudRegion/api/v2/workforce/management/managementunits/$managementUnitId/users"
+$usersResponse = Invoke-RestMethod -Uri $usersUrl -Method Get -Headers $apiHeaders
+
+if (-not $usersResponse.users) {
+    Write-Log "No users found in the specified management unit. Exiting." "Red"
+    exit
+}
+
+$userIds = $usersResponse.users.id
+# Create a lookup table for user names
+$userMap = @{}
+$usersResponse.users.ForEach({ $userMap[$_.id] = $_.name })
+Write-Log "Found $($userIds.Count) users to query."
+
+# --- 6. Get Agent Schedules ---
+Write-Log "Requesting agent schedules... (This may take a moment)"
+$scheduleUrl = "https://$genesysCloudRegion/api/v2/workforce/management/businessunits/$businessUnitId/agentschedules/search"
+$scheduleBody = @{
+    startDate = $startDateIso
+    endDate   = $endDateIso
+    userIds   = $userIds
+} | ConvertTo-Json
+
+$scheduleResponse = Invoke-RestMethod -Uri $scheduleUrl -Method Post -Headers $apiHeaders -Body $scheduleBody
+
+# --- 7. Process Schedules and Create CSV Data ---
+Write-Log "Processing schedule data..."
+$results = [System.Collections.Generic.List[object]]::new()
+
+foreach ($agentSchedule in $scheduleResponse.agentSchedules) {
+    $agentId = $agentSchedule.user.id
+    $agentName = $userMap[$agentId] # Look up agent name
+
+    if ($agentSchedule.shifts.Count -eq 0) {
+        # Handle cases where agent has no shift (e.g., day off is not an activity code)
+        $record = [PSCustomObject]@{
+            AgentName        = $agentName
+            Activity         = "No Shift Scheduled"
+            StartTime        = $null
+            EndTime          = $null
+            DurationMinutes  = $null
         }
+        $results.Add($record)
     }
-    throw "API call failed after retries: $Method $Path"
-}
-
-function Get-AllActiveUsers {
-    param([hashtable]$Headers)
-
-    $users = @()
-    $pageNumber = 1
-    $pageSize   = 100
-    do {
-        $path = "/api/v2/users?state=active&pageNumber=$pageNumber&pageSize=$pageSize"
-        $resp = Invoke-GC -Method Get -Path $path -Headers $Headers
-        if ($resp.entities) {
-            $users += $resp.entities | ForEach-Object {
-                [PSCustomObject]@{
-                    id   = $_.id
-                    name = $_.name
+    else {
+        foreach ($shift in $agentSchedule.shifts) {
+            foreach ($activity in $shift.activities) {
+                # Look up the friendly name for the activity code
+                $activityName = $activityCodeMap[$activity.activityCodeId]
+                
+                # Create a record for the CSV file
+                $record = [PSCustomObject]@{
+                    AgentName        = $agentName
+                    Activity         = $activityName
+                    StartTime        = $activity.startDate
+                    EndTime          = $activity.endDate
+                    DurationMinutes  = $activity.lengthMinutes
                 }
-            }
-        }
-        $pageNumber++
-        $more = ($resp.entities -and $resp.entities.Count -eq $pageSize)
-    } while ($more)
-
-    return $users
-}
-
-function New-IntervalForDay {
-    param(
-        [datetime]$LocalDayStart,   # midnight in $TimeZone
-        [string]$TimeZone
-    )
-    # Make ISO8601 with timezone offset preserved
-    $tzInfo = [System.TimeZoneInfo]::FindSystemTimeZoneById($TimeZone)
-    $startLocal = [System.TimeZoneInfo]::ConvertTime($LocalDayStart, $tzInfo)
-    $endLocal   = $startLocal.AddDays(1).AddMilliseconds(-1)
-
-    # Format with offset
-    $offsetStart = ([System.TimeZoneInfo]::GetUtcOffset($startLocal, $tzInfo)).ToString()
-    $offsetEnd   = ([System.TimeZoneInfo]::GetUtcOffset($endLocal,   $tzInfo)).ToString()
-
-    # PowerShell offset format sometimes "hh:mm:ss"; normalize to "+hh:mm"
-    function fmt([timespan]$ts) {
-        $sign = $ts.Ticks -ge 0 ? "+" : "-"
-        $abs  = [timespan]::FromTicks([Math]::Abs($ts.Ticks))
-        "{0}{1:00}:{2:00}" -f $sign, $abs.Hours + ($abs.Days*24), $abs.Minutes
-    }
-
-    $isoStart = "{0:yyyy-MM-dd}T{0:HH\:mm\:ss}{1}" -f $startLocal, (fmt ([System.TimeZoneInfo]::GetUtcOffset($startLocal, $tzInfo)))
-    $isoEnd   = "{0:yyyy-MM-dd}T{0:HH\:mm\:ss}{1}" -f $endLocal,   (fmt ([System.TimeZoneInfo]::GetUtcOffset($endLocal,   $tzInfo)))
-
-    return "$isoStart/$isoEnd"
-}
-
-function Build-ZeroRow {
-    param($date, $user)
-    [PSCustomObject]@{
-        Date            = $date.ToString('yyyy-MM-dd')
-        UserId          = $user.id
-        UserName        = $user.name
-        Answered        = 0
-        Transferred     = 0
-        tHandleSumSec   = 0
-        tHandleAvgSec   = 0
-        tTalkSumSec     = 0
-        tTalkAvgSec     = 0
-        tHeldSumSec     = 0
-        tHeldAvgSec     = 0
-        tAcwSumSec      = 0
-        tAcwAvgSec      = 0
-        tAlertSumSec    = 0
-    }
-}
-
-function Merge-MetricsIntoRow {
-    param(
-        [PSCustomObject]$row,
-        [object[]]$metricData
-    )
-    # Helpers to get sum and avg (seconds) for a time metric
-    function getSumSec($metricName) {
-        $m = $metricData | Where-Object { $_.metric -eq $metricName }
-        if ($m -and $m.stats -and $m.stats.sum) { [math]::Round($m.stats.sum / 1000, 3) } else { 0 }
-    }
-    function getAvgSec($metricName) {
-        $m = $metricData | Where-Object { $_.metric -eq $metricName }
-        if ($m -and $m.stats -and $m.stats.sum -and $m.stats.count -and $m.stats.count -gt 0) { 
-            [math]::Round(($m.stats.sum / $m.stats.count) / 1000, 3)
-        } else { 0 }
-    }
-    function getCount($metricName) {
-        # Prefer stats.count; some "n*" metrics may provide sum as the count
-        $m = $metricData | Where-Object { $_.metric -eq $metricName }
-        if ($m -and $m.stats) {
-            if ($m.stats.count) { [int]$m.stats.count }
-            elseif ($m.stats.sum) { [int]$m.stats.sum } else { 0 }
-        } else { 0 }
-    }
-
-    # Answered: use tHandle.count as the number of interactions handled by the agent for the day.
-    $row.Answered      = getCount "tHandle"
-    $row.Transferred   = getCount "nTransferred"
-
-    $row.tHandleSumSec = getSumSec "tHandle"
-    $row.tHandleAvgSec = getAvgSec "tHandle"
-
-    $row.tTalkSumSec   = getSumSec "tTalk"
-    $row.tTalkAvgSec   = getAvgSec "tTalk"
-
-    $row.tHeldSumSec   = getSumSec "tHeld"
-    $row.tHeldAvgSec   = getAvgSec "tHeld"
-
-    $row.tAcwSumSec    = getSumSec "tAcw"
-    $row.tAcwAvgSec    = getAvgSec "tAcw"
-
-    $row.tAlertSumSec  = getSumSec "tAlert"
-
-    return $row
-}
-
-# ===== MAIN =====
-$token   = Get-AccessToken
-$headers = @{ Authorization = "Bearer $token" }
-
-Write-Host "Fetching active users..." -ForegroundColor Cyan
-$users = Get-AllActiveUsers -Headers $headers
-if (-not $users -or $users.Count -eq 0) { throw "No active users returned." }
-
-Write-Host ("Users found: {0}" -f $users.Count) -ForegroundColor Green
-
-# Build a map for fast id->name lookup
-$userNameById = @{}
-$users | ForEach-Object { $userNameById[$_.id] = $_.name }
-
-# Pre-seed a dictionary of rows (date|userId) so we output zeros when no activity
-$rowsByKey = @{}
-$nowSydney = [System.TimeZoneInfo]::ConvertTimeBySystemTimeZoneId((Get-Date), $TimeZone)
-$endDay    = ($nowSydney.Date).AddDays(-1)   # yesterday end (avoid partial today)
-$startDay  = $endDay.AddDays(-$DaysBack + 1) # inclusive
-
-Write-Host ("Building empty matrix from {0:yyyy-MM-dd} to {1:yyyy-MM-dd}..." -f $startDay, $endDay) -ForegroundColor Cyan
-$current = $startDay
-while ($current -le $endDay) {
-    foreach ($u in $users) {
-        $key = "{0:yyyy-MM-dd}|{1}" -f $current, $u.id
-        $rowsByKey[$key] = Build-ZeroRow -date $current -user $u
-    }
-    $current = $current.AddDays(1)
-}
-
-# Chunk users and days for API calls
-$allUserIds = $users.id
-$dates = @()
-$d = $startDay
-while ($d -le $endDay) { $dates += $d; $d = $d.AddDays(1) }
-
-# Metrics we need (time + counts)
-$metrics = @("tHandle","tTalk","tHeld","tAcw","tAlert","nTransferred")
-
-Write-Host "Querying analytics (this may take a few minutes for 365 days)..." -ForegroundColor Yellow
-
-for ($i = 0; $i -lt $allUserIds.Count; $i += $UserBatchSize) {
-    $batchUserIds = $allUserIds[$i..([Math]::Min($i+$UserBatchSize-1, $allUserIds.Count-1))]
-
-    foreach ($day in $dates) {
-        $interval = New-IntervalForDay -LocalDayStart $day -TimeZone $TimeZone
-
-        $preds = @()
-        foreach ($uid in $batchUserIds) {
-            $preds += @{ type="dimension"; dimension="userId"; operator="matches"; value=$uid }
-        }
-
-        $body = @{
-            interval     = $interval
-            granularity  = "P1D"
-            groupBy      = @("userId")
-            timeZone     = $TimeZone
-            flattenMultivaluedDimensions = $true
-            metrics      = $metrics
-            filter       = @{
-                type = "or"
-                predicates = $preds
-            }
-            # Limit to voice via segmentFilters (mediaType is a segment-level dimension)
-            segmentFilters = @(@{
-                type = "and"
-                predicates = @(@{ type="dimension"; dimension="mediaType"; operator="matches"; value="voice" })
-            })
-        }
-
-        $resp = Invoke-GC -Method Post -Path "/api/v2/analytics/conversations/aggregates/query" -Headers $headers -Body $body
-
-        if ($resp.results) {
-            foreach ($r in $resp.results) {
-                # Expect group contains userId; interval is the day bucket
-                $uid = ($r.group | Where-Object { $_.dimension -eq "userId" }).value
-                if (-not $uid) { continue }
-
-                # The interval in response is a full-day bucket; use our $day string as key
-                $key = "{0:yyyy-MM-dd}|{1}" -f $day, $uid
-                if ($rowsByKey.ContainsKey($key)) {
-                    $rowsByKey[$key] = Merge-MetricsIntoRow -row $rowsByKey[$key] -metricData $r.data
-                }
+                $results.Add($record)
             }
         }
     }
 }
 
-# Export
-$todayStamp = (Get-Date).ToString("ddMMyyyy")
-$outFile = "Agent Performance $todayStamp.csv"
-$rowsByKey.GetEnumerator().Value | Sort-Object Date, UserName | Export-Csv -NoTypeInformation -Path $outFile -Encoding UTF8
-
-Write-Host ("Done. Wrote {0} rows to `"{1}`"." -f $rowsByKey.Count, $outFile) -ForegroundColor Green
+# --- 8. Export to CSV ---
+if ($results.Count -gt 0) {
+    # Add date to the filename
+    $datedCsvPath = $csvExportPath.Replace(".csv", "_$($yesterdayStart.ToString("yyyy-MM-dd")).csv")
+    $results | Export-Csv -Path $datedCsvPath -NoTypeInformation
+    Write-Log "Export complete! $($results.Count) records saved to $datedCsvPath" "Green"
+}
+else {
+    Write-Log "No schedule data was found to export." "Yellow"
+}
