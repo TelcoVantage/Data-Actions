@@ -1,8 +1,7 @@
 <# 
-  Genesys Cloud (AU) – Presence analytics with pagination + 429 retry
-  Detects ON_QUEUE → AVAILABLE → ON_QUEUE patterns and enriches triplet CSV
-  with presence + routing-status summaries. Compatible with Constrained Language Mode.
-  PowerShell 5.1 compatible. No external modules required.
+  Genesys Cloud (AU) – CLM-safe presence analytics
+  Detects ON_QUEUE → AVAILABLE → ON_QUEUE and exports triplet CSV with presence + routing summaries.
+  Works in Constrained Language Mode (no .NET static calls, no generic lists, no ternary, etc.).
 #>
 
 param(
@@ -16,32 +15,20 @@ param(
   [int]   $ThrottleMs    = 250
 )
 
-# ---------- (Optional) Use system proxy if your corp network requires it ----------
-try {
-  $proxy = [System.Net.WebRequest]::GetSystemWebProxy()
-  if ($proxy) {
-    $proxy.Credentials = [System.Net.CredentialCache]::DefaultCredentials
-    [System.Net.WebRequest]::DefaultWebProxy = $proxy
-  }
-} catch {}
+# ---------------- Helpers ----------------
 
-# ---------- Helpers ----------
 function Get-AccessToken {
   param([string]$Region, [string]$ClientId, [string]$ClientSecret)
-
   $tokenUrl = "https://login.$Region/oauth/token"
-
-  # Constrained Language Mode friendly: put client_id/secret in the form body (no Basic header)
   $body = @{
     grant_type    = 'client_credentials'
     client_id     = $ClientId
     client_secret = $ClientSecret
   }
-
   try {
     $resp = Invoke-RestMethod -Method Post -Uri $tokenUrl -Body $body -ContentType "application/x-www-form-urlencoded"
     if (-not $resp.access_token) { throw "No access_token in response." }
-    return $resp.access_token
+    $resp.access_token
   } catch {
     throw "Failed to obtain access token: $($_.Exception.Message)"
   }
@@ -60,6 +47,8 @@ function Invoke-GenesysApi {
   $uri  = if ($Path -like "http*") { $Path } else { "$base$Path" }
 
   $attempt = 0
+  $backoff = @(2,4,8,16,30,60)  # fixed ladder for CLM (no [math]::Pow)
+
   while ($true) {
     try {
       if ($Body -ne $null -and $Method -in @('POST','PUT','PATCH')) {
@@ -71,22 +60,25 @@ function Invoke-GenesysApi {
     }
     catch {
       $attempt++
-      $statusCode = try { [int]$_.Exception.Response.StatusCode } catch { 0 }
+      $resp = $null
+      $statusCode = 0
+      try { $resp = $_.Exception.Response; $statusCode = [int]$resp.StatusCode } catch {}
       if ($statusCode -ne 429 -or $attempt -gt $MaxRetries) { throw }
 
+      # Respect Retry-After header if present
       $retryAfter = 0
       try {
-        $resp = $_.Exception.Response
-        if ($resp -and $resp.Headers['Retry-After']) {
+        if ($resp -and $resp.Headers -and $resp.Headers['Retry-After']) {
           $retryAfter = [int]$resp.Headers['Retry-After']
-        } else {
-          $sr = New-Object IO.StreamReader($resp.GetResponseStream())
-          $text = $sr.ReadToEnd()
-          if ($text -match 'Retry the request in \[(\d+)\] seconds') { $retryAfter = [int]$matches[1] }
         }
       } catch {}
 
-      if ($retryAfter -lt 1) { $retryAfter = [math]::Min(60, [int]([math]::Pow(2, $attempt) + (Get-Random -Minimum 0 -Maximum 2))) }
+      if ($retryAfter -lt 1) {
+        $index = $attempt - 1
+        if ($index -ge $backoff.Count) { $index = $backoff.Count - 1 }
+        $retryAfter = $backoff[$index]
+      }
+
       Write-Warning ("429 received. Waiting {0}s then retrying (attempt {1}/{2})..." -f $retryAfter, $attempt, $MaxRetries)
       Start-Sleep -Seconds $retryAfter
     }
@@ -99,68 +91,76 @@ function Get-UserName {
   if ($script:UserNameCache.ContainsKey($UserId)) { return $script:UserNameCache[$UserId] }
   try {
     $u = Invoke-GenesysApi -Method GET -Path "/api/v2/users/$UserId" -Headers $Headers
-    $name = if ($u.name) { $u.name } else { $u.id }
+    $name = if ($u -and $u.name) { $u.name } else { $UserId }
     $script:UserNameCache[$UserId] = $name
-    return $name
+    $name
   } catch {
     $script:UserNameCache[$UserId] = $UserId
-    return $UserId
+    $UserId
   }
 }
 
 function To-Date {
   param([string]$s)
   if ([string]::IsNullOrWhiteSpace($s)) { return $null }
-  try { return [datetime]::Parse($s, $null, [System.Globalization.DateTimeStyles]::AssumeUniversal) } catch { return $null }
+  try { [datetime]::Parse($s, $null, [System.Globalization.DateTimeStyles]::AssumeUniversal) } catch { $null }
 }
 
-# Summarize routingStatus over a window [winStart, winEnd): returns "STATUS=secs; ..."
+# Overlap summary of routing statuses within a window: "STATUS=secs; ..."
 function Summarize-RoutingStatus {
   param(
-    [object[]]$RoutingStatuses,   # ud.routingStatus array
+    [object[]]$RoutingStatuses,
     [datetime]$WinStart,
     [datetime]$WinEnd
   )
   if (-not $RoutingStatuses -or -not $WinStart) { return $null }
-  if (-not $WinEnd) { $WinEnd = [DateTime]::UtcNow }
+  if (-not $WinEnd) { $WinEnd = (Get-Date).ToUniversalTime() }
 
   $totals = @{}
   foreach ($rs in $RoutingStatuses) {
     $rsStart = To-Date $rs.startTime
     if (-not $rsStart) { continue }
-    $rsEnd   = To-Date $rs.endTime
-    if (-not $rsEnd) { $rsEnd = [DateTime]::UtcNow }
+    $rsEnd = To-Date $rs.endTime
+    if (-not $rsEnd) { $rsEnd = (Get-Date).ToUniversalTime() }
 
-    # Overlap with window
     $ovStart = if ($rsStart -gt $WinStart) { $rsStart } else { $WinStart }
     $ovEnd   = if ($rsEnd   -lt $WinEnd)   { $rsEnd }   else { $WinEnd }
     if ($ovEnd -le $ovStart) { continue }
 
-    $secs = [int][math]::Round(($ovEnd - $ovStart).TotalSeconds)
+    $secs = [int]((New-TimeSpan -Start $ovStart -End $ovEnd).TotalSeconds)
     $key  = if ($rs.routingStatus) { [string]$rs.routingStatus } else { 'UNKNOWN' }
     if ($totals.ContainsKey($key)) { $totals[$key] += $secs } else { $totals[$key] = $secs }
   }
 
   if ($totals.Count -eq 0) { return $null }
-  ($totals.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { "{0}={1}" -f $_.Key, $_.Value }) -join "; "
+  ($totals.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "; "
 }
 
-# ---------- Main ----------
-try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+# Format to ISO 8601 without .ToString('o') (CLM-safe)
+function Iso8601 {
+  param([datetime]$dt)
+  if (-not $dt) { return $null }
+  (Get-Date -Date $dt -Format o)
+}
+
+# ---------------- Main ----------------
 
 $token       = Get-AccessToken -Region $Region -ClientId $ClientId -ClientSecret $ClientSecret
 $authHeaders = @{ Authorization = "Bearer $token" }
 
-$pageNumber   = [Math]::Max(1, $StartPage)
-$totalHits    = $null
+$pageNumber = [int]([Math]::Max(1, $StartPage))  # [Math]::Max may be blocked in CLM; fallback:
+if ($pageNumber -lt 1) { $pageNumber = 1 }
 
-$allPresenceRows = New-Object System.Collections.Generic.List[object]
-$onQueueToAvail  = New-Object System.Collections.Generic.List[object]
-$oqAvailOqList   = New-Object System.Collections.Generic.List[object]
+$allPresenceRows = @()
+$onQueueToAvail  = @()
+$oqAvailOqList   = @()
 
 Write-Host "Querying /api/v2/analytics/users/details/query for interval $Interval ..." -ForegroundColor Cyan
 
-do {
+$moreLikely = $true
+$totalHits  = $null
+
+while ($moreLikely) {
   $body = @{
     interval = $Interval
     order    = "asc"
@@ -172,7 +172,7 @@ do {
 
   $resp = Invoke-GenesysApi -Method POST -Path "/api/v2/analytics/users/details/query" -Headers $authHeaders -Body $body
 
-  if ($null -eq $resp -or -not $resp.userDetails) {
+  if (-not $resp -or -not $resp.userDetails) {
     Write-Warning "No userDetails on page $pageNumber."
     break
   }
@@ -183,24 +183,24 @@ do {
     $userId   = $ud.userId
     $userName = if ($ResolveNames) { Get-UserName -UserId $userId -Headers $authHeaders } else { $userId }
 
-    # Collect presence blocks + export all blocks with seconds
+    # Build ordered presence blocks
     $blocks = @()
     foreach ($p in ($ud.primaryPresence | ForEach-Object { $_ })) {
       $pStart = To-Date $p.startTime
+      if (-not $pStart) { continue }
       $pEnd   = To-Date $p.endTime
-      if ($null -eq $pStart) { continue }
-      $effectiveEnd = if ($pEnd) { $pEnd } else { [DateTime]::UtcNow }
-      $seconds      = [int][math]::Round(($effectiveEnd - $pStart).TotalSeconds)
+      if (-not $pEnd) { $pEnd = (Get-Date).ToUniversalTime() }
+      $seconds = [int]((New-TimeSpan -Start $pStart -End $pEnd).TotalSeconds)
 
-      $allPresenceRows.Add([pscustomobject]@{
+      $allPresenceRows += [pscustomobject]@{
         UserId        = $userId
         UserName      = $userName
         Presence      = $p.systemPresence
         OrgPresenceId = $p.organizationPresenceId
-        StartTimeUtc  = $pStart.ToString("o")
-        EndTimeUtc    = if ($pEnd) { $pEnd.ToString("o") } else { $null }
+        StartTimeUtc  = Iso8601 $pStart
+        EndTimeUtc    = Iso8601 $pEnd
         Seconds       = $seconds
-      })
+      }
 
       $blocks += [pscustomobject]@{
         Start = $pStart
@@ -210,30 +210,28 @@ do {
       }
     }
 
-    # Ensure chronological
+    # Sort by start time
     $blocks = $blocks | Sort-Object Start
 
-    # Adjacent ON_QUEUE -> AVAILABLE pairs
+    # Adjacent ON_QUEUE -> AVAILABLE pairs (optional export we keep)
     for ($i = 1; $i -lt $blocks.Count; $i++) {
-      $prev = $blocks[$i-1]
-      $curr = $blocks[$i]
+      $prev = $blocks[$i-1]; $curr = $blocks[$i]
       if ($prev.Pres -eq 'ON_QUEUE' -and $curr.Pres -eq 'AVAILABLE') {
-        $prevEnd  = if ($prev.End) { $prev.End } else { [DateTime]::UtcNow }
-        $gapSecs  = [int][math]::Round(($curr.Start - $prevEnd).TotalSeconds)
-
-        $onQueueToAvail.Add([pscustomobject]@{
+        $gapSecs = [int]((New-TimeSpan -Start $prev.End -End $curr.Start).TotalSeconds)
+        if ($gapSecs -lt 0) { $gapSecs = 0 }
+        $onQueueToAvail += [pscustomobject]@{
           UserId           = $userId
           UserName         = $userName
           PrevPresence     = $prev.Pres
-          PrevStartTimeUtc = $prev.Start.ToString("o")
-          PrevEndTimeUtc   = if ($prev.End) { $prev.End.ToString("o") } else { $null }
+          PrevStartTimeUtc = Iso8601 $prev.Start
+          PrevEndTimeUtc   = Iso8601 $prev.End
           PrevSeconds      = $prev.Sec
           CurrPresence     = $curr.Pres
-          CurrStartTimeUtc = $curr.Start.ToString("o")
-          CurrEndTimeUtc   = if ($curr.End) { $curr.End.ToString("o") } else { $null }
+          CurrStartTimeUtc = Iso8601 $curr.Start
+          CurrEndTimeUtc   = Iso8601 $curr.End
           CurrSeconds      = $curr.Sec
           GapSeconds       = $gapSecs
-        })
+        }
       }
     }
 
@@ -242,42 +240,33 @@ do {
       $one   = $blocks[$i-2]
       $two   = $blocks[$i-1]
       $three = $blocks[$i]
-
       if ($one.Pres -eq 'ON_QUEUE' -and $two.Pres -eq 'AVAILABLE' -and $three.Pres -eq 'ON_QUEUE') {
-        $oneEnd   = if ($one.End)   { $one.End }   else { [DateTime]::UtcNow }
-        $twoEnd   = if ($two.End)   { $two.End }   else { [DateTime]::UtcNow }
-        $threeEnd = if ($three.End) { $three.End } else { [DateTime]::UtcNow }
+        $rs1 = Summarize-RoutingStatus -RoutingStatuses $ud.routingStatus -WinStart $one.Start   -WinEnd $one.End
+        $rs2 = Summarize-RoutingStatus -RoutingStatuses $ud.routingStatus -WinStart $two.Start   -WinEnd $two.End
+        $rs3 = Summarize-RoutingStatus -RoutingStatuses $ud.routingStatus -WinStart $three.Start -WinEnd $three.End
 
-        # RoutingStatus summaries for each segment window
-        $rs1 = Summarize-RoutingStatus -RoutingStatuses $ud.routingStatus -WinStart $one.Start   -WinEnd $oneEnd
-        $rs2 = Summarize-RoutingStatus -RoutingStatuses $ud.routingStatus -WinStart $two.Start   -WinEnd $twoEnd
-        $rs3 = Summarize-RoutingStatus -RoutingStatuses $ud.routingStatus -WinStart $three.Start -WinEnd $threeEnd
-
-        $oqAvailOqList.Add([pscustomobject]@{
+        $oqAvailOqList += [pscustomobject]@{
           UserId                = $userId
           UserName              = $userName
 
-          # First ON_QUEUE block
           FirstOnQueue_Presence = 'ON_QUEUE'
-          FirstOnQueue_StartUtc = $one.Start.ToString("o")
-          FirstOnQueue_EndUtc   = if ($one.End)   { $one.End.ToString("o") }   else { $null }
+          FirstOnQueue_StartUtc = Iso8601 $one.Start
+          FirstOnQueue_EndUtc   = Iso8601 $one.End
           FirstOnQueue_Seconds  = $one.Sec
           FirstOnQueue_RoutingStatus = $rs1
 
-          # AVAILABLE block
           Available_Presence    = 'AVAILABLE'
-          Available_StartUtc    = $two.Start.ToString("o")
-          Available_EndUtc      = if ($two.End)   { $two.End.ToString("o") }   else { $null }
+          Available_StartUtc    = Iso8601 $two.Start
+          Available_EndUtc      = Iso8601 $two.End
           Available_Seconds     = $two.Sec
           Available_RoutingStatus = $rs2
 
-          # Next ON_QUEUE block
           NextOnQueue_Presence  = 'ON_QUEUE'
-          NextOnQueue_StartUtc  = $three.Start.ToString("o")
-          NextOnQueue_EndUtc    = if ($three.End) { $three.End.ToString("o") } else { $null }
+          NextOnQueue_StartUtc  = Iso8601 $three.Start
+          NextOnQueue_EndUtc    = Iso8601 $three.End
           NextOnQueue_Seconds   = $three.Sec
           NextOnQueue_RoutingStatus = $rs3
-        })
+        }
       }
     }
   }
@@ -291,10 +280,10 @@ do {
 
   $moreLikely = $false
   if ($resp.userDetails.Count -eq $PageSize) { $moreLikely = $true }
-  if ($null -ne $totalHits) { $moreLikely = ($processed -lt $totalHits) }
-} while ($moreLikely)
+  if ($null -ne $totalHits) { if ($processed -lt $totalHits) { $moreLikely = $true } }
+}
 
-# ---------- Export ----------
+# ---------------- Export ----------------
 $stamp   = (Get-Date).ToUniversalTime().ToString("yyyyMMdd_HHmmss")
 $allCsv  = "Presence_AllBlocks_$stamp.csv"
 $tranCsv = "Presence_OnQueueToAvailable_$stamp.csv"
@@ -311,7 +300,6 @@ Write-Host "• ON_QUEUE → AVAILABLE pairs:   $tranCsv" -ForegroundColor Green
 Write-Host "• OQ → AVAILABLE → OQ triplets: $tripCsv" -ForegroundColor Green
 Write-Host ""
 
-# Console summary (triplets)
 if ($oqAvailOqList.Count -gt 0) {
   Write-Host "Top users by OQ→Available→OQ triplets:" -ForegroundColor Yellow
   $oqAvailOqList | Group-Object UserName | Sort-Object Count -Descending |
