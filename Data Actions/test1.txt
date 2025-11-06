@@ -1,15 +1,11 @@
 Sick Leave (Distinct Agent/Dept/Date) :=
-VAR _RowsWithinFilters =
-    CALCULATETABLE(
-        SELECTCOLUMNS(
-            'Agent Leave',
-            "AgentName",    RELATED('AgentName'[Agent Name]),
-            "Department",   RELATED('AgentName'[Department]),
-            "Date",         DATEVALUE('Agent Leave'[Date])   -- strips time, groups by day
-        ),
-        KEEPFILTERS( 'Activity code'[entities.name] = "Sick Leave" )
-        -- If the Agent Leave → Activity code relationship is INACTIVE, uncomment next line:
-        -- , USERELATIONSHIP('Agent Leave'[ActivityID], 'Activity code'[ActivityID])
+CALCULATE(
+    COUNTROWS(
+        SUMMARIZECOLUMNS(
+            'AgentName'[Agent Name],
+            'AgentName'[Department],
+            'Agent Leave'[Date],
+            KEEPFILTERS( 'Activity code'[entities.name] = "Sick Leave" )
+        )
     )
-RETURN
-    COUNTROWS( DISTINCT( _RowsWithinFilters ) )
+)
