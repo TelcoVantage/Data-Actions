@@ -4,8 +4,28 @@ CALCULATE(
         SUMMARIZECOLUMNS(
             'AgentName'[Agent Name],
             'AgentName'[Department],
-            'Agent Leave'[Date],
-            KEEPFILTERS( 'Activity code'[entities.name] = "Sick Leave" )
+            'Agent Leave'[Date]      -- use a pure Date column if yours is DateTime
         )
-    )
+    ),
+    KEEPFILTERS( 'Activity code'[entities.name] = "Sick Leave" )
+    -- If 'Agent Leave' -> 'Activity code' is inactive, uncomment:
+    -- , USERELATIONSHIP('Agent Leave'[ActivityID], 'Activity code'[ActivityID])
 )
+
+
+
+
+Sick Leave (Distinct Agent/Dept/Date) :=
+VAR _Base :=
+    CALCULATETABLE(
+        SELECTCOLUMNS(
+            'Agent Leave',
+            "AgentName",    RELATED('AgentName'[Agent Name]),
+            "Department",   RELATED('AgentName'[Department]),
+            "Date",         DATEVALUE('Agent Leave'[Date])
+        ),
+        KEEPFILTERS( 'Activity code'[entities.name] = "Sick Leave" )
+        -- , USERELATIONSHIP('Agent Leave'[ActivityID], 'Activity code'[ActivityID])
+    )
+RETURN
+    COUNTROWS( DISTINCT(_Base) )
