@@ -1,25 +1,169 @@
-<# 
-  Genesys Cloud (AU) – CLM-safe presence analytics
-  Detects ON_QUEUE → AVAILABLE → ON_QUEUE and exports triplet CSV with presence + routing summaries.
-  Works in Constrained Language Mode (no .NET static calls, no generic lists, no ternary, etc.).
-#>
+# Genesys Cloud Copilot Token Usage Report
+# This script retrieves Copilot token usage for the last 6 months broken down by month
 
-param(
-  [string]$Region        = "mypurecloud.com.au",
-  [string]$ClientId      = "b5cfd3ca-e1e0-4af2-86ba-a815f618e62a",
-  [string]$ClientSecret  = "hPp4KSICLFJV1hoMsoxTXuXKY594TkKmsKcA2IjsrnE",
-  [string]$Interval      = "2025-10-15T13:00:00.000Z/2025-10-17T13:00:00.000Z",
-  [int]   $PageSize      = 100,
-  [bool]  $ResolveNames  = $true,
-  [int]   $StartPage     = 1,
-  [int]   $ThrottleMs    = 250
-)
+# ============================================
+# CONFIGURATION
+# ============================================
+$ClientId = "YOUR_CLIENT_ID_HERE"
+$ClientSecret = "YOUR_CLIENT_SECRET_HERE"
+$Environment = "mypurecloud.com.au"  # Change to your region (e.g., mypurecloud.com, mypurecloud.ie, etc.)
 
-# ---------------- Helpers ----------------
+# ============================================
+# AUTHENTICATION
+# ============================================
+Write-Host "Authenticating with Genesys Cloud..." -ForegroundColor Cyan
 
-function Get-AccessToken {
-  param([string]$Region, [string]$ClientId, [string]$ClientSecret)
-  $tokenUrl = "https://login.$Region/oauth/token"
+$tokenUrl = "https://login.$Environment/oauth/token"
+$authHeader = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${ClientId}:${ClientSecret}"))
+
+$tokenBody = @{
+    grant_type = "client_credentials"
+}
+
+$tokenHeaders = @{
+    "Authorization" = "Basic $authHeader"
+    "Content-Type" = "application/x-www-form-urlencoded"
+}
+
+try {
+    $tokenResponse = Invoke-RestMethod -Uri $tokenUrl -Method Post -Headers $tokenHeaders -Body $tokenBody
+    $accessToken = $tokenResponse.access_token
+    Write-Host "Authentication successful!" -ForegroundColor Green
+}
+catch {
+    Write-Host "Authentication failed: $_" -ForegroundColor Red
+    exit
+}
+
+# ============================================
+# PREPARE DATE RANGES
+# ============================================
+$results = @()
+$currentDate = Get-Date
+
+# Calculate start of each month for the last 6 months
+for ($i = 0; $i -lt 6; $i++) {
+    $monthStart = (Get-Date).AddMonths(-$i).Date
+    $monthStart = Get-Date -Year $monthStart.Year -Month $monthStart.Month -Day 1 -Hour 0 -Minute 0 -Second 0
+    
+    # Get last day of the month
+    $monthEnd = $monthStart.AddMonths(1).AddSeconds(-1)
+    
+    # Don't go beyond current date for the current month
+    if ($monthEnd -gt $currentDate) {
+        $monthEnd = $currentDate
+    }
+    
+    $results += @{
+        MonthName = $monthStart.ToString("MMMM yyyy")
+        StartDate = $monthStart.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+        EndDate = $monthEnd.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+        Month = $monthStart.Month
+        Year = $monthStart.Year
+    }
+}
+
+# Reverse to show oldest to newest
+[array]::Reverse($results)
+
+# ============================================
+# RETRIEVE COPILOT TOKEN USAGE
+# ============================================
+Write-Host "`nRetrieving Copilot token usage data..." -ForegroundColor Cyan
+
+$apiHeaders = @{
+    "Authorization" = "Bearer $accessToken"
+    "Content-Type" = "application/json"
+}
+
+$usageData = @()
+
+foreach ($period in $results) {
+    Write-Host "Processing $($period.MonthName)..." -ForegroundColor Yellow
+    
+    # API endpoint for Copilot usage
+    $usageUrl = "https://api.$Environment/api/v2/usage/query"
+    
+    $queryBody = @{
+        interval = "$($period.StartDate)/$($period.EndDate)"
+        granularity = "Day"
+        metrics = @("nTokensInput", "nTokensOutput")
+        groupBy = @("Date")
+    } | ConvertTo-Json -Depth 10
+    
+    try {
+        $response = Invoke-RestMethod -Uri $usageUrl -Method Post -Headers $apiHeaders -Body $queryBody
+        
+        $totalInputTokens = 0
+        $totalOutputTokens = 0
+        
+        if ($response.results) {
+            foreach ($result in $response.results) {
+                if ($result.data) {
+                    foreach ($dataPoint in $result.data) {
+                        if ($dataPoint.metrics) {
+                            $totalInputTokens += [int]($dataPoint.metrics.nTokensInput ?? 0)
+                            $totalOutputTokens += [int]($dataPoint.metrics.nTokensOutput ?? 0)
+                        }
+                    }
+                }
+            }
+        }
+        
+        $usageData += [PSCustomObject]@{
+            Month = $period.MonthName
+            InputTokens = $totalInputTokens
+            OutputTokens = $totalOutputTokens
+            TotalTokens = $totalInputTokens + $totalOutputTokens
+        }
+    }
+    catch {
+        Write-Host "Error retrieving data for $($period.MonthName): $_" -ForegroundColor Red
+        
+        $usageData += [PSCustomObject]@{
+            Month = $period.MonthName
+            InputTokens = "Error"
+            OutputTokens = "Error"
+            TotalTokens = "Error"
+        }
+    }
+    
+    Start-Sleep -Milliseconds 500  # Rate limiting
+}
+
+# ============================================
+# DISPLAY RESULTS
+# ============================================
+Write-Host "`n==========================================" -ForegroundColor Green
+Write-Host "COPILOT TOKEN USAGE - LAST 6 MONTHS" -ForegroundColor Green
+Write-Host "==========================================" -ForegroundColor Green
+
+$usageData | Format-Table -AutoSize
+
+# Calculate totals
+$totalInput = ($usageData | Where-Object { $_.InputTokens -ne "Error" } | Measure-Object -Property InputTokens -Sum).Sum
+$totalOutput = ($usageData | Where-Object { $_.OutputTokens -ne "Error" } | Measure-Object -Property OutputTokens -Sum).Sum
+$totalAll = ($usageData | Where-Object { $_.TotalTokens -ne "Error" } | Measure-Object -Property TotalTokens -Sum).Sum
+
+Write-Host "`n------------------------------------------" -ForegroundColor Cyan
+Write-Host "SUMMARY (6 Month Period)" -ForegroundColor Cyan
+Write-Host "------------------------------------------" -ForegroundColor Cyan
+Write-Host "Total Input Tokens:  $($totalInput.ToString('N0'))" -ForegroundColor White
+Write-Host "Total Output Tokens: $($totalOutput.ToString('N0'))" -ForegroundColor White
+Write-Host "Grand Total Tokens:  $($totalAll.ToString('N0'))" -ForegroundColor White
+Write-Host "------------------------------------------`n" -ForegroundColor Cyan
+
+# ============================================
+# EXPORT TO CSV (OPTIONAL)
+# ============================================
+$exportPath = "CopilotTokenUsage_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$usageData | Export-Csv -Path $exportPath -NoTypeInformation
+Write-Host "Data exported to: $exportPath" -ForegroundColor Green
+Configuration needed:
+Line 8: Add your OAuth Client ID
+Line 9: Add your OAuth Client Secret
+Line 10: Verify your region (mypurecloud.com.au for Australia)
+Required permissions: Your OAuth client needs usage or analytics:readonly role.  $tokenUrl = "https://login.$Region/oauth/token"
   $body = @{
     grant_type    = 'client_credentials'
     client_id     = $ClientId
