@@ -1,36 +1,21 @@
 <#
 .SYNOPSIS
-    Extracts all available data for conversations that went through a Genesys Cloud
-    Voice Survey flow (AU region / ap-southeast-2).
+    Genesys Cloud Voice Survey flow data export (AU region) - CONSTRAINED LANGUAGE MODE SAFE.
 
 .DESCRIPTION
-    Workflow:
-      1. Authenticates via OAuth Client Credentials (login.mypurecloud.com.au)
-      2. Resolves the voice survey flow ID by name (or uses a hardcoded ID)
-      3. Runs an async Analytics Conversation Details job filtered on that flowId
-         to find every conversation that touched the survey flow in the interval
-      4. For each conversation, pulls:
-           - Survey results (scores, answers, form, status) via Quality API
-           - Full conversation detail (sessions, flow entry/exit reasons, metrics)
-           - Participant attributes (any DTMF/speech slot values your flow writes)
-      5. Flattens everything to two CSVs (conversation-level + per-question answers)
-         and dumps raw JSON per conversation for anything not flattened.
+    Rewritten for PowerShell Constrained Language Mode (AppLocker/WDAC lockdown):
+      - No [Convert]:: / [Text.Encoding]:: calls  -> pure-PowerShell Base64 encoder
+      - No [System.Collections.Generic.List]::new() -> plain arrays
+      - No [uri]::EscapeDataString -> flows listed by type and matched client-side;
+        cursor encoded with simple string replaces
+    Functionality is identical to v1:
+      1. OAuth client credentials token (login.mypurecloud.com.au)
+      2. Resolve voice survey flow ID by name (client-side match)
+      3. Async analytics details job filtered on flowId
+      4. Per conversation: survey scores/answers, flow session data, participant attributes
+      5. Export: SurveyConversations.csv, SurveyAnswers.csv, ParticipantAttributes.csv + raw JSON
 
-    NOTE on DTMF vs Speech: Genesys analytics does not directly flag whether a
-    survey answer came in via DTMF or ASR. If your survey flow writes the input
-    mode / raw utterance to participant data (Set Participant Data action), it
-    will appear in the ParticipantAttributes output. Otherwise, enable voice
-    transcription on the survey session and pull it via Speech & Text Analytics.
-
-.REQUIRED OAUTH SCOPES (Client Credentials grant, with a role that has):
-    analytics:conversationDetail:view
-    quality:survey:view  (or quality readonly)
-    architect:flow:view
-    conversation:communication:view
-
-.NOTES
-    Author: Richard (Workplace Engineering)
-    Region: mypurecloud.com.au (ap-southeast-2)
+    Check your language mode with:  $ExecutionContext.SessionState.LanguageMode
 #>
 
 # ============================================================================
@@ -42,23 +27,61 @@ $ClientSecret   = "YOUR_CLIENT_SECRET_HERE"
 $LoginBase      = "https://login.mypurecloud.com.au"
 $ApiBase        = "https://api.mypurecloud.com.au"
 
-# EITHER set the flow name (script resolves the ID) OR hardcode the flow ID
-$SurveyFlowName = "Post Call Voice Survey"     # <-- your voice survey flow name
-$SurveyFlowId   = ""                            # <-- optional: paste flow GUID to skip lookup
+$SurveyFlowName = "Post Call Voice Survey"   # exact flow name (case-insensitive match)
+$SurveyFlowId   = ""                          # optional: paste flow GUID to skip lookup
 
-# Reporting interval (max 31 days per details job is safe; script uses one job)
 $DaysBack       = 30
 $IntervalStart  = (Get-Date).AddDays(-$DaysBack).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 $IntervalEnd    = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 
-# Output
-$OutDir         = Join-Path (Get-Location) "VoiceSurveyExport_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+$OutDir         = Join-Path (Get-Location) ("VoiceSurveyExport_" + (Get-Date -Format 'yyyyMMdd_HHmmss'))
 $RawJsonDir     = Join-Path $OutDir "raw"
 
 # ============================================================================
-# HELPERS
+# HELPERS (Constrained Language Mode safe)
 # ============================================================================
-New-Item -ItemType Directory -Path $OutDir, $RawJsonDir -Force | Out-Null
+New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+New-Item -ItemType Directory -Path $RawJsonDir -Force | Out-Null
+
+Write-Host ("PowerShell language mode: " + $ExecutionContext.SessionState.LanguageMode)
+
+function ConvertTo-Base64Ascii {
+    # Pure-PowerShell Base64 (no [Convert]/[Text.Encoding]) - CLM safe.
+    # Client IDs/secrets are ASCII so this is sufficient.
+    param([string]$Text)
+    $alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    $bytes = @()
+    foreach ($c in $Text.ToCharArray()) { $bytes += [int]$c }
+    $out = ""
+    for ($i = 0; $i -lt $bytes.Count; $i += 3) {
+        $b1 = $bytes[$i]
+        $has2 = (($i + 1) -lt $bytes.Count)
+        $has3 = (($i + 2) -lt $bytes.Count)
+        $out += $alphabet[$b1 -shr 2]
+        if ($has2) {
+            $b2 = $bytes[$i + 1]
+            $out += $alphabet[(($b1 -band 3) -shl 4) -bor ($b2 -shr 4)]
+            if ($has3) {
+                $b3 = $bytes[$i + 2]
+                $out += $alphabet[(($b2 -band 15) -shl 2) -bor ($b3 -shr 6)]
+                $out += $alphabet[$b3 -band 63]
+            } else {
+                $out += $alphabet[(($b2 -band 15) -shl 2)]
+                $out += "="
+            }
+        } else {
+            $out += $alphabet[(($b1 -band 3) -shl 4)]
+            $out += "=="
+        }
+    }
+    return $out
+}
+
+function Encode-QueryValue {
+    # Minimal URL encoding for cursor values (no [uri]:: needed)
+    param([string]$Value)
+    return $Value.Replace("%", "%25").Replace("+", "%2B").Replace("/", "%2F").Replace("=", "%3D").Replace("&", "%26")
+}
 
 function Invoke-GcApi {
     param(
@@ -67,68 +90,96 @@ function Invoke-GcApi {
         [object]$Body = $null,
         [int]$MaxRetries = 5
     )
-    $uri = "$ApiBase$Path"
+    $uri = $ApiBase + $Path
     for ($i = 0; $i -lt $MaxRetries; $i++) {
         try {
-            $params = @{
-                Method  = $Method
-                Uri     = $uri
-                Headers = @{ Authorization = "Bearer $script:Token" }
-                ContentType = "application/json"
+            if ($Body -ne $null) {
+                $json = $Body | ConvertTo-Json -Depth 20
+                return Invoke-RestMethod -Method $Method -Uri $uri -ContentType "application/json" `
+                    -Headers @{ Authorization = "Bearer " + $script:Token } -Body $json
+            } else {
+                return Invoke-RestMethod -Method $Method -Uri $uri -ContentType "application/json" `
+                    -Headers @{ Authorization = "Bearer " + $script:Token }
             }
-            if ($Body) { $params.Body = ($Body | ConvertTo-Json -Depth 20) }
-            return Invoke-RestMethod @params
         }
         catch {
-            $status = $_.Exception.Response.StatusCode.value__
-            if ($status -eq 429) {
-                $retryAfter = 5
-                try { $retryAfter = [int]$_.Exception.Response.Headers["Retry-After"] } catch {}
-                Write-Warning "Rate limited (429). Waiting $retryAfter s..."
-                Start-Sleep -Seconds ($retryAfter + 1)
+            $msg = "" + $_.Exception.Message
+            $status = 0
+            try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+            if ($status -eq 429 -or $msg -like "*429*") {
+                Write-Warning "Rate limited (429). Waiting 10s..."
+                Start-Sleep -Seconds 10
                 continue
             }
-            if ($status -eq 404) { return $null }   # e.g. no surveys on conversation
+            if ($status -eq 404 -or $msg -like "*404*") { return $null }
+            Write-Warning ("API error on " + $Method + " " + $Path + " : " + $msg)
             throw
         }
     }
-    throw "Max retries exceeded for $Method $Path"
+    throw ("Max retries exceeded for " + $Method + " " + $Path)
 }
 
 # ============================================================================
 # 1. AUTHENTICATE
 # ============================================================================
-Write-Host "Authenticating to $LoginBase ..." -ForegroundColor Cyan
-$authHeader = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$ClientId`:$ClientSecret"))
-$tokenResp = Invoke-RestMethod -Method POST -Uri "$LoginBase/oauth/token" `
-    -Headers @{ Authorization = "Basic $authHeader" } `
+if ($ClientId -eq "YOUR_CLIENT_ID_HERE" -or $ClientSecret -eq "YOUR_CLIENT_SECRET_HERE") {
+    throw "Edit the script and set `$ClientId and `$ClientSecret first."
+}
+
+Write-Host ("Authenticating to " + $LoginBase + " ...") -ForegroundColor Cyan
+$authHeader = ConvertTo-Base64Ascii -Text ($ClientId + ":" + $ClientSecret)
+$tokenResp = Invoke-RestMethod -Method POST -Uri ($LoginBase + "/oauth/token") `
+    -Headers @{ Authorization = "Basic " + $authHeader } `
     -ContentType "application/x-www-form-urlencoded" `
     -Body "grant_type=client_credentials"
+
+if (-not $tokenResp.access_token) { throw "Token request failed - no access_token returned. Check client ID/secret." }
 $script:Token = $tokenResp.access_token
 Write-Host "Authenticated OK." -ForegroundColor Green
 
 # ============================================================================
-# 2. RESOLVE VOICE SURVEY FLOW ID
+# 2. RESOLVE VOICE SURVEY FLOW ID (client-side match, no URL encoding needed)
 # ============================================================================
-if ([string]::IsNullOrWhiteSpace($SurveyFlowId)) {
-    Write-Host "Resolving flow ID for '$SurveyFlowName' ..." -ForegroundColor Cyan
-    $flows = Invoke-GcApi -Path "/api/v2/flows?type=voicesurvey&name=$([uri]::EscapeDataString($SurveyFlowName))&pageSize=50"
-    if (-not $flows.entities -or $flows.entities.Count -eq 0) {
-        # fallback: search all flow types by name
-        $flows = Invoke-GcApi -Path "/api/v2/flows?name=$([uri]::EscapeDataString($SurveyFlowName))&pageSize=50"
+if ($SurveyFlowId -eq "") {
+    Write-Host ("Resolving flow ID for '" + $SurveyFlowName + "' ...") -ForegroundColor Cyan
+    $flow = $null
+    $pageNum = 1
+    do {
+        $flows = Invoke-GcApi -Path ("/api/v2/flows?type=voicesurvey&pageSize=100&pageNumber=" + $pageNum)
+        if ($flows -and $flows.entities) {
+            foreach ($f in $flows.entities) {
+                if ($f.name -ieq $SurveyFlowName) { $flow = $f }
+            }
+        }
+        $pageNum++
+    } while ($flow -eq $null -and $flows -and $flows.entities -and $flows.entities.Count -eq 100)
+
+    if ($flow -eq $null) {
+        # fallback: list ALL flows and match by name
+        Write-Host "Not found under type=voicesurvey, searching all flow types..." -ForegroundColor Yellow
+        $pageNum = 1
+        do {
+            $flows = Invoke-GcApi -Path ("/api/v2/flows?pageSize=100&pageNumber=" + $pageNum)
+            if ($flows -and $flows.entities) {
+                foreach ($f in $flows.entities) {
+                    if ($f.name -ieq $SurveyFlowName) { $flow = $f }
+                }
+            }
+            $pageNum++
+        } while ($flow -eq $null -and $flows -and $flows.entities -and $flows.entities.Count -eq 100)
     }
-    $flow = $flows.entities | Where-Object { $_.name -eq $SurveyFlowName } | Select-Object -First 1
-    if (-not $flow) { throw "Flow '$SurveyFlowName' not found. Check the name or hardcode `$SurveyFlowId." }
+
+    if ($flow -eq $null) { throw ("Flow '" + $SurveyFlowName + "' not found. Check the name or hardcode `$SurveyFlowId.") }
     $SurveyFlowId = $flow.id
-    Write-Host "Flow resolved: $($flow.name) [$SurveyFlowId] (type: $($flow.type))" -ForegroundColor Green
+    Write-Host ("Flow resolved: " + $flow.name + " [" + $SurveyFlowId + "] (type: " + $flow.type + ")") -ForegroundColor Green
 }
 
 # ============================================================================
 # 3. ANALYTICS DETAILS JOB - ALL CONVERSATIONS THROUGH THIS FLOW
 # ============================================================================
-Write-Host "Submitting analytics conversation details job ($IntervalStart -> $IntervalEnd)..." -ForegroundColor Cyan
+Write-Host ("Submitting analytics details job (" + $IntervalStart + " -> " + $IntervalEnd + ")...") -ForegroundColor Cyan
 $jobBody = @{
-    interval = "$IntervalStart/$IntervalEnd"
+    interval = ($IntervalStart + "/" + $IntervalEnd)
     order    = "asc"
     orderBy  = "conversationStart"
     segmentFilters = @(
@@ -142,139 +193,151 @@ $jobBody = @{
 }
 $job = Invoke-GcApi -Method POST -Path "/api/v2/analytics/conversations/details/jobs" -Body $jobBody
 $jobId = $job.jobId
-Write-Host "Job submitted: $jobId. Polling..." -ForegroundColor Cyan
+Write-Host ("Job submitted: " + $jobId + ". Polling...") -ForegroundColor Cyan
 
 do {
     Start-Sleep -Seconds 3
-    $jobStatus = Invoke-GcApi -Path "/api/v2/analytics/conversations/details/jobs/$jobId"
-    Write-Host "  Job state: $($jobStatus.state)"
-} while ($jobStatus.state -in @("PENDING", "QUEUED", "RUNNING"))
+    $jobStatus = Invoke-GcApi -Path ("/api/v2/analytics/conversations/details/jobs/" + $jobId)
+    Write-Host ("  Job state: " + $jobStatus.state)
+} while ($jobStatus.state -eq "PENDING" -or $jobStatus.state -eq "QUEUED" -or $jobStatus.state -eq "RUNNING")
 
-if ($jobStatus.state -ne "FULFILLED") { throw "Details job failed: $($jobStatus.state) $($jobStatus.errorMessage)" }
+if ($jobStatus.state -ne "FULFILLED") { throw ("Details job failed: " + $jobStatus.state) }
 
-# Page through results
-$conversations = [System.Collections.Generic.List[object]]::new()
+$conversations = @()
 $cursor = $null
 do {
-    $path = "/api/v2/analytics/conversations/details/jobs/$jobId/results?pageSize=500"
-    if ($cursor) { $path += "&cursor=$([uri]::EscapeDataString($cursor))" }
+    $path = "/api/v2/analytics/conversations/details/jobs/" + $jobId + "/results?pageSize=500"
+    if ($cursor) { $path = $path + "&cursor=" + (Encode-QueryValue -Value $cursor) }
     $page = Invoke-GcApi -Path $path
-    if ($page.conversations) { $page.conversations | ForEach-Object { $conversations.Add($_) } }
+    if ($page.conversations) { $conversations += $page.conversations }
     $cursor = $page.cursor
 } while ($cursor)
 
-Write-Host "Found $($conversations.Count) conversations through the survey flow." -ForegroundColor Green
+Write-Host ("Found " + $conversations.Count + " conversations through the survey flow.") -ForegroundColor Green
 if ($conversations.Count -eq 0) { Write-Warning "Nothing to export."; return }
 
 # ============================================================================
-# 4. ENRICH EACH CONVERSATION (surveys, participant attributes) & FLATTEN
+# 4. ENRICH EACH CONVERSATION & FLATTEN
 # ============================================================================
-$convRows   = [System.Collections.Generic.List[object]]::new()
-$answerRows = [System.Collections.Generic.List[object]]::new()
-$attrRows   = [System.Collections.Generic.List[object]]::new()
+$convRows   = @()
+$answerRows = @()
+$attrRows   = @()
 
 $counter = 0
 foreach ($conv in $conversations) {
     $counter++
     $convId = $conv.conversationId
-    Write-Host "[$counter/$($conversations.Count)] $convId"
+    Write-Host ("[" + $counter + "/" + $conversations.Count + "] " + $convId)
 
-    # ---- Flow session data for the survey flow (from analytics detail) ----
-    $surveySessions = @()
+    # ---- Survey flow session data from analytics detail ----
+    $fs = $null
     foreach ($p in $conv.participants) {
         foreach ($s in $p.sessions) {
-            if ($s.flow -and $s.flow.flowId -eq $SurveyFlowId) {
-                $surveySessions += [pscustomobject]@{
-                    Participant   = $p.purpose
-                    FlowName      = $s.flow.flowName
-                    FlowVersion   = $s.flow.flowVersion
-                    FlowType      = $s.flow.flowType
-                    EntryReason   = $s.flow.entryReason
-                    EntryType     = $s.flow.entryType
-                    ExitReason    = $s.flow.exitReason
-                    TransferType  = $s.flow.transferType
-                    TransferTarget= $s.flow.transferTargetName
-                    Outcomes      = ($s.flow.outcomes | ForEach-Object { "$($_.flowOutcome):$($_.flowOutcomeValue)" }) -join "; "
+            if ($s.flow -and $s.flow.flowId -eq $SurveyFlowId -and $fs -eq $null) {
+                $outcomeStr = ""
+                if ($s.flow.outcomes) {
+                    foreach ($o in $s.flow.outcomes) {
+                        if ($outcomeStr -ne "") { $outcomeStr += "; " }
+                        $outcomeStr += ("" + $o.flowOutcome + ":" + $o.flowOutcomeValue)
+                    }
+                }
+                $fs = [pscustomobject]@{
+                    FlowName    = $s.flow.flowName
+                    FlowVersion = $s.flow.flowVersion
+                    EntryReason = $s.flow.entryReason
+                    EntryType   = $s.flow.entryType
+                    ExitReason  = $s.flow.exitReason
+                    Outcomes    = $outcomeStr
                 }
             }
         }
     }
-    $fs = $surveySessions | Select-Object -First 1
 
-    # ---- ANI/DNIS, queue, agent from the customer/acd/agent participants ----
-    $ani   = ($conv.participants | ForEach-Object { $_.sessions } | Where-Object { $_.ani }   | Select-Object -First 1).ani
-    $dnis  = ($conv.participants | ForEach-Object { $_.sessions } | Where-Object { $_.dnis }  | Select-Object -First 1).dnis
-    $queue = ($conv.participants | Where-Object { $_.purpose -eq "acd" }   | Select-Object -First 1).participantName
-    $agent = ($conv.participants | Where-Object { $_.purpose -eq "agent" } | Select-Object -First 1).userId
+    # ---- ANI/DNIS, queue, agent ----
+    $ani = $null; $dnis = $null; $queue = $null; $agent = $null
+    foreach ($p in $conv.participants) {
+        if ($p.purpose -eq "acd" -and $queue -eq $null)   { $queue = $p.participantName }
+        if ($p.purpose -eq "agent" -and $agent -eq $null) { $agent = $p.userId }
+        foreach ($s in $p.sessions) {
+            if ($s.ani -and $ani -eq $null)   { $ani = $s.ani }
+            if ($s.dnis -and $dnis -eq $null) { $dnis = $s.dnis }
+        }
+    }
 
     # ---- Survey results via Quality API ----
-    $surveys = Invoke-GcApi -Path "/api/v2/quality/conversations/$convId/surveys"
+    $surveys = Invoke-GcApi -Path ("/api/v2/quality/conversations/" + $convId + "/surveys")
     $surveyList = @()
     if ($surveys) {
-        # endpoint may return an array or an entities wrapper depending on version
-        $surveyList = if ($surveys.entities) { $surveys.entities } elseif ($surveys -is [array]) { $surveys } else { @($surveys) }
+        if ($surveys.entities) { $surveyList = $surveys.entities }
+        elseif ($surveys -is [array]) { $surveyList = $surveys }
+        else { $surveyList = @($surveys) }
     }
 
     $totalScore = $null; $surveyStatus = $null; $surveyFormName = $null; $promoterScore = $null
     foreach ($sv in $surveyList) {
         $surveyStatus   = $sv.status
         $surveyFormName = $sv.surveyForm.name
-        $totalScore     = $sv.answers.totalScore
-        $promoterScore  = $sv.answers.npsScore
-        if ($sv.answers.questionGroupScores) {
-            foreach ($qg in $sv.answers.questionGroupScores) {
-                foreach ($q in $qg.questionScores) {
-                    # Resolve question text from the form definition if present
-                    $qText = $null; $aText = $null
-                    if ($sv.surveyForm.questionGroups) {
-                        $formQ = $sv.surveyForm.questionGroups |
-                                 ForEach-Object { $_.questions } |
-                                 Where-Object { $_.id -eq $q.questionId } | Select-Object -First 1
-                        $qText = $formQ.text
-                        if ($formQ.answerOptions -and $q.answerId) {
-                            $aText = ($formQ.answerOptions | Where-Object { $_.id -eq $q.answerId }).text
+        if ($sv.answers) {
+            $totalScore    = $sv.answers.totalScore
+            $promoterScore = $sv.answers.npsScore
+            if ($sv.answers.questionGroupScores) {
+                foreach ($qg in $sv.answers.questionGroupScores) {
+                    foreach ($q in $qg.questionScores) {
+                        $qText = $null; $aText = $null
+                        if ($sv.surveyForm.questionGroups) {
+                            foreach ($formQg in $sv.surveyForm.questionGroups) {
+                                foreach ($formQ in $formQg.questions) {
+                                    if ($formQ.id -eq $q.questionId) {
+                                        $qText = $formQ.text
+                                        if ($formQ.answerOptions -and $q.answerId) {
+                                            foreach ($ao in $formQ.answerOptions) {
+                                                if ($ao.id -eq $q.answerId) { $aText = $ao.text }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        $answerRows += [pscustomobject]@{
+                            ConversationId    = $convId
+                            ConversationStart = $conv.conversationStart
+                            SurveyForm        = $surveyFormName
+                            SurveyStatus      = $sv.status
+                            QuestionGroupId   = $qg.questionGroupId
+                            QuestionId        = $q.questionId
+                            QuestionText      = $qText
+                            AnswerId          = $q.answerId
+                            AnswerText        = $aText
+                            Score             = $q.score
+                            NpsScore          = $q.npsScore
+                            FreeTextAnswer    = $q.freeTextAnswer
+                            MarkedNA          = $q.markedNA
                         }
                     }
-                    $answerRows.Add([pscustomobject]@{
-                        ConversationId = $convId
-                        ConversationStart = $conv.conversationStart
-                        SurveyForm     = $surveyFormName
-                        SurveyStatus   = $sv.status
-                        QuestionGroupId= $qg.questionGroupId
-                        QuestionId     = $q.questionId
-                        QuestionText   = $qText
-                        AnswerId       = $q.answerId
-                        AnswerText     = $aText
-                        Score          = $q.score
-                        NpsScore       = $q.npsScore
-                        FreeTextAnswer = $q.freeTextAnswer
-                        AssistedAnswerId = $q.assistedAnswerId
-                        MarkedNA       = $q.markedNA
-                    })
                 }
             }
         }
     }
 
-    # ---- Participant attributes (DTMF/speech slot values if your flow sets them) ----
-    $fullConv = Invoke-GcApi -Path "/api/v2/conversations/$convId"
+    # ---- Participant attributes (DTMF/speech slot values if flow sets them) ----
+    $fullConv = Invoke-GcApi -Path ("/api/v2/conversations/" + $convId)
     if ($fullConv) {
         foreach ($p in $fullConv.participants) {
-            if ($p.attributes -and $p.attributes.PSObject.Properties.Count -gt 0) {
+            if ($p.attributes) {
                 foreach ($prop in $p.attributes.PSObject.Properties) {
-                    $attrRows.Add([pscustomobject]@{
+                    $attrRows += [pscustomobject]@{
                         ConversationId = $convId
                         Participant    = $p.purpose
                         AttributeName  = $prop.Name
                         AttributeValue = $prop.Value
-                    })
+                    }
                 }
             }
         }
     }
 
     # ---- Conversation-level summary row ----
-    $convRows.Add([pscustomobject]@{
+    $convRows += [pscustomobject]@{
         ConversationId    = $convId
         ConversationStart = $conv.conversationStart
         ConversationEnd   = $conv.conversationEnd
@@ -293,23 +356,19 @@ foreach ($conv in $conversations) {
         SurveyStatus      = $surveyStatus
         SurveyTotalScore  = $totalScore
         NpsScore          = $promoterScore
-        DivisionIds       = ($conv.divisionIds -join ";")
-    })
+    }
 
-    # ---- Raw JSON dump (everything, nothing lost) ----
-    @{
-        analyticsDetail = $conv
-        surveys         = $surveyList
-        conversation    = $fullConv
-    } | ConvertTo-Json -Depth 30 | Out-File (Join-Path $RawJsonDir "$convId.json") -Encoding utf8
+    # ---- Raw JSON dump ----
+    $rawObj = @{ analyticsDetail = $conv; surveys = $surveyList; conversation = $fullConv }
+    $rawObj | ConvertTo-Json -Depth 30 | Out-File (Join-Path $RawJsonDir ($convId + ".json")) -Encoding utf8
 }
 
 # ============================================================================
 # 5. EXPORT
 # ============================================================================
-$convCsv   = Join-Path $OutDir "SurveyConversations.csv"
-$ansCsv    = Join-Path $OutDir "SurveyAnswers.csv"
-$attrCsv   = Join-Path $OutDir "ParticipantAttributes.csv"
+$convCsv = Join-Path $OutDir "SurveyConversations.csv"
+$ansCsv  = Join-Path $OutDir "SurveyAnswers.csv"
+$attrCsv = Join-Path $OutDir "ParticipantAttributes.csv"
 
 $convRows   | Export-Csv $convCsv -NoTypeInformation -Encoding UTF8
 $answerRows | Export-Csv $ansCsv  -NoTypeInformation -Encoding UTF8
@@ -317,7 +376,7 @@ $attrRows   | Export-Csv $attrCsv -NoTypeInformation -Encoding UTF8
 
 Write-Host ""
 Write-Host "=== EXPORT COMPLETE ===" -ForegroundColor Green
-Write-Host "Conversations : $($convRows.Count)  -> $convCsv"
-Write-Host "Answers       : $($answerRows.Count) -> $ansCsv"
-Write-Host "Attributes    : $($attrRows.Count)  -> $attrCsv"
-Write-Host "Raw JSON      : $RawJsonDir"
+Write-Host ("Conversations : " + $convRows.Count + "  -> " + $convCsv)
+Write-Host ("Answers       : " + $answerRows.Count + " -> " + $ansCsv)
+Write-Host ("Attributes    : " + $attrRows.Count + "  -> " + $attrCsv)
+Write-Host ("Raw JSON      : " + $RawJsonDir)
