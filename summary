@@ -1,0 +1,715 @@
+<#
+.SYNOPSIS
+    Genesys Cloud (Sydney / mypurecloud.com.au) - AI Copilot Summary Edit Rate & Content Patterns.
+    Fully Constrained Language Mode (CLM) safe - Windows PowerShell 5.1 / AppLocker-WDAC endpoints.
+
+.DESCRIPTION
+    Captures EVERY Copilot summary in the window (edited AND unedited) so edit rate has a true
+    denominator, then derives content-pattern metrics from the generated vs edited text.
+
+    Flow:
+        1. OAuth2 Client Credentials token (Basic header built with a pure-PowerShell Base64
+           encoder - no [Convert]:: / [Text.Encoding]:: calls).
+        2. (Optional) Resolve queue IDs for a division by listing queues and filtering
+           client-side (no URL encoding needed).
+        3. Analytics conversation detail query for the window (paged).
+        4. GET /api/v2/conversations/{id}/summaries per conversation.
+           editedSummary / editedReason / editedResolution / editedFollowup are empty
+           until an agent edits - populated text = edit signal.
+        5. Computes per-field metrics: generated length, edited length, delta,
+           word-overlap % (how much of the AI draft survived the edit).
+        6. Exports 4 CSVs: per-summary detail, per-agent rollup, per-queue rollup,
+           per-field pattern rollup. Prints a console summary.
+
+    IMPORTANT - RETENTION: Copilot summaries are only retrievable for ~10 days unless
+    persisted via Speech & Text Analytics. Keep $DaysBack at 9 or less, and schedule this
+    regularly to build history.
+
+    CLM compliance notes:
+        - No .NET static method calls, no ::new(), no [pscustomobject].
+        - New-Object PSObject -Property used for all row objects; explicit
+          Select-Object ordering applied before every Export-Csv.
+        - HTTP status via [int]$_.Exception.Response.StatusCode with message fallback.
+        - Rounding done with [int] casts, not [math]::Round.
+
+.NOTES
+    OAuth client (Client Credentials grant) needs roles granting at least:
+        analytics > conversationDetail > view
+        conversation > summary > view   (Copilot / summary read permission)
+        routing > queue > view          (queue names / division scoping)
+        directory > user > view         (agent names)
+
+    !!! Credentials are embedded for LOCAL TESTING ONLY. Move to a secure store
+    !!! (e.g. Windows Credential Manager / encrypted file) before scheduling or sharing.
+#>
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+$ClientId     = "YOUR_CLIENT_ID_HERE"
+$ClientSecret = "YOUR_CLIENT_SECRET_HERE"
+
+# Region: Sydney, Australia (AWS ap-southeast-2)
+#   Auth : https://login.mypurecloud.com.au/oauth/token
+#   API  : https://api.mypurecloud.com.au
+$Environment  = "mypurecloud.com.au"
+
+# Lookback window in days. Summaries expire after ~10 days - keep this <= 9.
+$DaysBack     = 7
+
+# Scoping (leave both empty for org-wide = maximum data):
+$DivisionId   = ""            # e.g. "abcd1234-...."  -> auto-resolves that division's queues
+$QueueIds     = @()           # e.g. @("queue-guid-1","queue-guid-2") -> overrides DivisionId
+
+# Include full generated/edited text in the detail CSV.
+# $true = richest data for content-pattern analysis; $false = metrics only (PII-safe).
+$IncludeSummaryText = $true
+
+# Throttle between per-conversation summary calls (ms). Raise if you hit 429s often.
+$ThrottleMs   = 200
+
+# Safety cap on analytics paging (pages x 100 conversations).
+$MaxPages     = 300
+
+# Output folder (created if missing)
+$OutputFolder = "C:\Temp\GenesysCopilot"
+
+# ============================================================
+# DERIVED / SCRIPT STATE
+# ============================================================
+$script:TokenUrl    = "https://login.$Environment/oauth/token"
+$script:ApiBase     = "https://api.$Environment"
+$script:AccessToken = ""
+$script:QueueCache  = @{}
+$script:UserCache   = @{}
+
+# ============================================================
+# PURE-POWERSHELL BASE64 (CLM-safe, no [Convert]::)
+# ============================================================
+function ConvertTo-Base64Clm {
+    param([string]$Text)
+    $alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    $bytes = @()
+    foreach ($c in $Text.ToCharArray()) {
+        $bytes += ([int]$c -band 255)
+    }
+    $result = ""
+    $i = 0
+    while ($i -lt $bytes.Count) {
+        $b0 = $bytes[$i]
+        $hasB1 = (($i + 1) -lt $bytes.Count)
+        $hasB2 = (($i + 2) -lt $bytes.Count)
+        $b1 = 0
+        $b2 = 0
+        if ($hasB1) { $b1 = $bytes[$i + 1] }
+        if ($hasB2) { $b2 = $bytes[$i + 2] }
+
+        $c0 = ($b0 -shr 2) -band 63
+        $c1 = (($b0 -band 3) -shl 4) -bor (($b1 -shr 4) -band 15)
+        $c2 = (($b1 -band 15) -shl 2) -bor (($b2 -shr 6) -band 3)
+        $c3 = $b2 -band 63
+
+        $result += $alphabet.Substring($c0, 1)
+        $result += $alphabet.Substring($c1, 1)
+        if ($hasB1) { $result += $alphabet.Substring($c2, 1) } else { $result += "=" }
+        if ($hasB2) { $result += $alphabet.Substring($c3, 1) } else { $result += "=" }
+        $i += 3
+    }
+    return $result
+}
+
+# ============================================================
+# AUTH
+# ============================================================
+function Get-GcAccessToken {
+    Write-Host "Authenticating to $script:TokenUrl ..." -ForegroundColor Cyan
+    $basic = ConvertTo-Base64Clm -Text ($ClientId + ":" + $ClientSecret)
+    $headers = @{
+        "Authorization" = "Basic $basic"
+        "Content-Type"  = "application/x-www-form-urlencoded"
+    }
+    $resp = $null
+    try {
+        $resp = Invoke-RestMethod -Uri $script:TokenUrl -Method Post -Headers $headers -Body "grant_type=client_credentials"
+    } catch {
+        $status = 0
+        try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+        $msg = ""
+        try { $msg = [string]$_.Exception.Message } catch { $msg = "unknown error" }
+        throw "Authentication request failed (HTTP $status): $msg"
+    }
+    if (-not $resp) { throw "Authentication returned no response body." }
+    if (-not $resp.access_token) { throw "Authentication response did not contain access_token - check client id/secret and OAuth grant type." }
+    $script:AccessToken = $resp.access_token
+    Write-Host "Authentication successful." -ForegroundColor Green
+}
+
+# ============================================================
+# API WRAPPER - retry on 429, re-auth on 401, $null on 404
+# ============================================================
+function Invoke-GcApi {
+    param(
+        [string]$Method,
+        [string]$Path,
+        $Body
+    )
+    $maxAttempts = 5
+    $attempt = 0
+    while ($attempt -lt $maxAttempts) {
+        $attempt++
+        $headers = @{
+            "Authorization" = "Bearer " + $script:AccessToken
+            "Content-Type"  = "application/json"
+        }
+        $uri = $script:ApiBase + $Path
+        try {
+            if ($null -ne $Body) {
+                $json = $Body | ConvertTo-Json -Depth 10
+                return Invoke-RestMethod -Uri $uri -Method $Method -Headers $headers -Body $json
+            } else {
+                return Invoke-RestMethod -Uri $uri -Method $Method -Headers $headers
+            }
+        } catch {
+            $status = 0
+            try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+            $msg = ""
+            try { $msg = [string]$_.Exception.Message } catch { $msg = "" }
+            if ($status -eq 0) {
+                if     ($msg -like "*429*") { $status = 429 }
+                elseif ($msg -like "*401*") { $status = 401 }
+                elseif ($msg -like "*404*") { $status = 404 }
+                elseif ($msg -like "*403*") { $status = 403 }
+            }
+
+            if ($status -eq 404) {
+                return $null   # no data for this resource - treat as empty, not fatal
+            }
+            if ($status -eq 429) {
+                Write-Host "  Rate limited (429) - waiting 10s (attempt $attempt/$maxAttempts) ..." -ForegroundColor Yellow
+                Start-Sleep -Seconds 10
+                continue
+            }
+            if ($status -eq 401 -and $attempt -lt $maxAttempts) {
+                Write-Host "  Token expired (401) - re-authenticating ..." -ForegroundColor Yellow
+                Get-GcAccessToken
+                continue
+            }
+            if ($status -eq 403) {
+                throw "Permission denied (403) calling $Path - check the OAuth client's roles. Detail: $msg"
+            }
+            if ($attempt -ge $maxAttempts) {
+                throw "API call failed after $maxAttempts attempts (HTTP $status) - $Method $Path : $msg"
+            }
+            Start-Sleep -Seconds 3
+        }
+    }
+    return $null
+}
+
+# ============================================================
+# HELPERS
+# ============================================================
+function Get-TextValue {
+    # Copilot summary fields arrive as objects with a .text property (e.g. reason { text }).
+    # Empty object {} = not populated / not edited.
+    param($Field)
+    if ($null -eq $Field) { return "" }
+    if ($Field -is [string]) { return $Field }
+    $t = $null
+    try { $t = $Field.text } catch { $t = $null }
+    if ($t) { return [string]$t }
+    return ""
+}
+
+function Get-Pct {
+    param($Numerator, $Denominator)
+    if (-not $Denominator -or $Denominator -eq 0) { return 0 }
+    $raw = ($Numerator / $Denominator) * 100
+    $scaled = [int]($raw * 10)
+    return ($scaled / 10)
+}
+
+function Get-Avg {
+    param($Sum, $Count)
+    if (-not $Count -or $Count -eq 0) { return 0 }
+    $raw = $Sum / $Count
+    $scaled = [int]($raw * 10)
+    return ($scaled / 10)
+}
+
+function Get-WordOverlapPct {
+    # Jaccard-style word overlap between generated and edited text.
+    # 100 = agent kept everything; low = heavy rewrite. "" when not comparable.
+    param([string]$TextA, [string]$TextB)
+    if (-not $TextA -or -not $TextB) { return "" }
+    $setA = @{}
+    foreach ($w in ($TextA.ToLower() -split "[^a-z0-9']+")) {
+        if ($w) { $setA[$w] = $true }
+    }
+    $setB = @{}
+    foreach ($w in ($TextB.ToLower() -split "[^a-z0-9']+")) {
+        if ($w) { $setB[$w] = $true }
+    }
+    if ($setA.Count -eq 0 -and $setB.Count -eq 0) { return "" }
+    $union = @{}
+    $common = 0
+    foreach ($k in $setA.Keys) { $union[$k] = $true }
+    foreach ($k in $setB.Keys) {
+        if ($setA.ContainsKey($k)) { $common++ }
+        $union[$k] = $true
+    }
+    if ($union.Count -eq 0) { return "" }
+    return (Get-Pct -Numerator $common -Denominator $union.Count)
+}
+
+function Get-QueueName {
+    param([string]$QueueId)
+    if (-not $QueueId) { return "" }
+    if ($script:QueueCache.ContainsKey($QueueId)) { return $script:QueueCache[$QueueId] }
+    $name = ""
+    $q = Invoke-GcApi -Method "Get" -Path ("/api/v2/routing/queues/" + $QueueId)
+    if ($q -and $q.name) { $name = [string]$q.name }
+    $script:QueueCache[$QueueId] = $name
+    return $name
+}
+
+function Get-AgentName {
+    param([string]$UserId)
+    if (-not $UserId) { return "" }
+    if ($script:UserCache.ContainsKey($UserId)) { return $script:UserCache[$UserId] }
+    $name = ""
+    $u = Invoke-GcApi -Method "Get" -Path ("/api/v2/users/" + $UserId)
+    if ($u -and $u.name) { $name = [string]$u.name }
+    $script:UserCache[$UserId] = $name
+    return $name
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+$runStart = Get-Date
+
+if ($ClientId -eq "YOUR_CLIENT_ID_HERE" -or $ClientSecret -eq "YOUR_CLIENT_SECRET_HERE") {
+    throw "Set your ClientId / ClientSecret in the CONFIGURATION block before running."
+}
+if (-not (Test-Path -Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+}
+
+Get-GcAccessToken
+
+# ---- Interval (machine local -> UTC; endpoint is Sydney so local = AEST/AEDT) ----
+$endLocal   = Get-Date
+$startLocal = $endLocal.AddDays(-1 * $DaysBack)
+$startUtc   = $startLocal.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.000") + "Z"
+$endUtc     = $endLocal.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.000") + "Z"
+$interval   = "$startUtc/$endUtc"
+Write-Host "Query interval (UTC): $interval" -ForegroundColor Cyan
+
+# ---- Resolve queue scope ----
+$targetQueueIds = @()
+if ($QueueIds.Count -gt 0) {
+    $targetQueueIds = $QueueIds
+    Write-Host ("Scoped to " + $targetQueueIds.Count + " explicitly configured queue(s).") -ForegroundColor Cyan
+} elseif ($DivisionId -ne "") {
+    Write-Host "Resolving queues for division $DivisionId ..." -ForegroundColor Cyan
+    $qPage = 1
+    while ($true) {
+        $qResp = Invoke-GcApi -Method "Get" -Path ("/api/v2/routing/queues?pageSize=100&pageNumber=" + $qPage)
+        if (-not $qResp -or -not $qResp.entities -or $qResp.entities.Count -eq 0) { break }
+        foreach ($q in $qResp.entities) {
+            $qDivId = ""
+            try { $qDivId = [string]$q.division.id } catch { $qDivId = "" }
+            if ($qDivId -eq $DivisionId) {
+                $targetQueueIds += [string]$q.id
+                $script:QueueCache[[string]$q.id] = [string]$q.name
+            }
+        }
+        if ($qResp.pageCount -and $qPage -ge [int]$qResp.pageCount) { break }
+        $qPage++
+        if ($qPage -gt 50) { break }
+    }
+    Write-Host ("Found " + $targetQueueIds.Count + " queue(s) in division.") -ForegroundColor Cyan
+    if ($targetQueueIds.Count -eq 0) {
+        throw "No queues found for division $DivisionId - check the division ID."
+    }
+} else {
+    Write-Host "No division/queue scope set - querying ORG-WIDE (maximum data)." -ForegroundColor Cyan
+}
+
+# ---- Analytics conversation detail query (paged) ----
+Write-Host "Querying conversation details ..." -ForegroundColor Cyan
+$conversations = @()
+$pageNumber = 1
+while ($pageNumber -le $MaxPages) {
+    $body = @{
+        interval = $interval
+        order    = "asc"
+        orderBy  = "conversationStart"
+        paging   = @{
+            pageSize   = 100
+            pageNumber = $pageNumber
+        }
+    }
+    if ($targetQueueIds.Count -gt 0) {
+        $preds = @()
+        foreach ($qid in $targetQueueIds) {
+            $preds += @{ dimension = "queueId"; value = $qid }
+        }
+        $body["segmentFilters"] = @(
+            @{ type = "or"; predicates = $preds }
+        )
+    }
+    $resp = Invoke-GcApi -Method "Post" -Path "/api/v2/analytics/conversations/details/query" -Body $body
+    if (-not $resp -or -not $resp.conversations -or $resp.conversations.Count -eq 0) { break }
+    $conversations += $resp.conversations
+    Write-Host ("  Page " + $pageNumber + " -> " + $conversations.Count + " conversations so far") -ForegroundColor Gray
+    if ($resp.conversations.Count -lt 100) { break }
+    $pageNumber++
+}
+Write-Host ("Total conversations in window: " + $conversations.Count) -ForegroundColor Green
+
+if ($conversations.Count -eq 0) {
+    Write-Host "No conversations found - nothing to do." -ForegroundColor Yellow
+}
+
+# ---- Per-conversation summaries + metric build ----
+$fieldNames  = @("Summary", "Reason", "Resolution", "Followup")
+$detailRows  = @()
+$agentStats  = @{}
+$queueStats  = @{}
+$fieldStats  = @{}
+foreach ($fn in $fieldNames) {
+    $fieldStats[$fn] = @{
+        Total = 0; Edited = 0
+        GenLenSum = 0; EditLenSum = 0; DeltaSum = 0
+        OverlapSum = 0; OverlapCount = 0
+    }
+}
+
+$convWithSummary = 0
+$totalSummaries  = 0
+$editedSummaries = 0
+$processed       = 0
+
+foreach ($conv in $conversations) {
+    $processed++
+    if (($processed % 25) -eq 0) {
+        Write-Host ("  Processed " + $processed + " / " + $conversations.Count + " conversations ...") -ForegroundColor Gray
+    }
+
+    $convId = [string]$conv.conversationId
+
+    # Extract agent / queue / media from the detail record
+    $agentId   = ""
+    $queueId   = ""
+    $mediaType = ""
+    foreach ($p in $conv.participants) {
+        $purpose = ""
+        try { $purpose = [string]$p.purpose } catch { $purpose = "" }
+        if ($purpose -eq "agent" -and $agentId -eq "") {
+            try { $agentId = [string]$p.userId } catch { $agentId = "" }
+        }
+        foreach ($s in $p.sessions) {
+            if ($mediaType -eq "") {
+                try { $mediaType = [string]$s.mediaType } catch { $mediaType = "" }
+            }
+            foreach ($seg in $s.segments) {
+                if ($queueId -eq "") {
+                    $segQ = ""
+                    try { $segQ = [string]$seg.queueId } catch { $segQ = "" }
+                    if ($segQ) { $queueId = $segQ }
+                }
+            }
+        }
+    }
+
+    # Fetch summaries (null = 404 / none)
+    $sumResp = Invoke-GcApi -Method "Get" -Path ("/api/v2/conversations/" + $convId + "/summaries")
+    if ($ThrottleMs -gt 0) { Start-Sleep -Milliseconds $ThrottleMs }
+    if (-not $sumResp) { continue }
+
+    $entities = $null
+    try { $entities = $sumResp.entities } catch { $entities = $null }
+    if (-not $entities) {
+        # Some payloads return the summary object(s) at the top level
+        if ($sumResp.id) { $entities = @($sumResp) } else { continue }
+    }
+    if ($entities.Count -eq 0) { continue }
+
+    $convWithSummary++
+    $agentName = Get-AgentName -UserId $agentId
+    $queueName = Get-QueueName -QueueId $queueId
+
+    foreach ($entity in $entities) {
+        $totalSummaries++
+        $summaryId = ""
+        try { $summaryId = [string]$entity.id } catch { $summaryId = "" }
+        $language = ""
+        try { $language = [string]$entity.language } catch { $language = "" }
+
+        # Generated vs edited text for all four Copilot fields
+        $genText  = @{}
+        $editText = @{}
+        $genText["Summary"]     = Get-TextValue -Field $entity.summary
+        $genText["Reason"]      = Get-TextValue -Field $entity.reason
+        $genText["Resolution"]  = Get-TextValue -Field $entity.resolution
+        $genText["Followup"]    = Get-TextValue -Field $entity.followup
+        $editText["Summary"]    = Get-TextValue -Field $entity.editedSummary
+        $editText["Reason"]     = Get-TextValue -Field $entity.editedReason
+        $editText["Resolution"] = Get-TextValue -Field $entity.editedResolution
+        $editText["Followup"]   = Get-TextValue -Field $entity.editedFollowup
+
+        $editedFields = @()
+        $metrics = @{}
+        foreach ($fn in $fieldNames) {
+            $g = $genText[$fn]
+            $e = $editText[$fn]
+            $wasFieldEdited = ($e -ne "")
+            if ($wasFieldEdited) { $editedFields += $fn }
+
+            $gLen = 0
+            if ($g) { $gLen = $g.Length }
+            $eLen = ""
+            $delta = ""
+            $overlap = ""
+            if ($wasFieldEdited) {
+                $eLen = $e.Length
+                $delta = $eLen - $gLen
+                $overlap = Get-WordOverlapPct -TextA $g -TextB $e
+            }
+            $metrics[$fn] = @{ GenLen = $gLen; EditLen = $eLen; Delta = $delta; Overlap = $overlap }
+
+            # Field rollup
+            if ($g -ne "" -or $wasFieldEdited) {
+                $fs = $fieldStats[$fn]
+                $fs["Total"] = $fs["Total"] + 1
+                $fs["GenLenSum"] = $fs["GenLenSum"] + $gLen
+                if ($wasFieldEdited) {
+                    $fs["Edited"] = $fs["Edited"] + 1
+                    $fs["EditLenSum"] = $fs["EditLenSum"] + $eLen
+                    $fs["DeltaSum"] = $fs["DeltaSum"] + $delta
+                    if ($overlap -ne "") {
+                        $fs["OverlapSum"] = $fs["OverlapSum"] + $overlap
+                        $fs["OverlapCount"] = $fs["OverlapCount"] + 1
+                    }
+                }
+            }
+        }
+
+        $wasEdited = ($editedFields.Count -gt 0)
+        if ($wasEdited) { $editedSummaries++ }
+
+        # Agent rollup
+        $agentKey = $agentId
+        if ($agentKey -eq "") { $agentKey = "(no agent)" }
+        if (-not $agentStats.ContainsKey($agentKey)) {
+            $agentStats[$agentKey] = @{
+                AgentName = $agentName; Total = 0; Edited = 0
+                SummaryEdits = 0; ReasonEdits = 0; ResolutionEdits = 0; FollowupEdits = 0
+                DeltaSum = 0; DeltaCount = 0; OverlapSum = 0; OverlapCount = 0
+            }
+        }
+        $as = $agentStats[$agentKey]
+        $as["Total"] = $as["Total"] + 1
+        if ($wasEdited) { $as["Edited"] = $as["Edited"] + 1 }
+        foreach ($fn in $fieldNames) {
+            if ($editedFields -contains $fn) {
+                $as[$fn + "Edits"] = $as[$fn + "Edits"] + 1
+                $m = $metrics[$fn]
+                if ($m["Delta"] -ne "") {
+                    $as["DeltaSum"] = $as["DeltaSum"] + $m["Delta"]
+                    $as["DeltaCount"] = $as["DeltaCount"] + 1
+                }
+                if ($m["Overlap"] -ne "") {
+                    $as["OverlapSum"] = $as["OverlapSum"] + $m["Overlap"]
+                    $as["OverlapCount"] = $as["OverlapCount"] + 1
+                }
+            }
+        }
+
+        # Queue rollup
+        $queueKey = $queueId
+        if ($queueKey -eq "") { $queueKey = "(no queue)" }
+        if (-not $queueStats.ContainsKey($queueKey)) {
+            $queueStats[$queueKey] = @{ QueueName = $queueName; Total = 0; Edited = 0 }
+        }
+        $qs = $queueStats[$queueKey]
+        $qs["Total"] = $qs["Total"] + 1
+        if ($wasEdited) { $qs["Edited"] = $qs["Edited"] + 1 }
+
+        # Detail row (text columns blanked when IncludeSummaryText = $false; schema stays stable)
+        $rowGenSummary = ""; $rowEditSummary = ""
+        $rowGenReason = ""; $rowEditReason = ""
+        $rowGenResolution = ""; $rowEditResolution = ""
+        $rowGenFollowup = ""; $rowEditFollowup = ""
+        if ($IncludeSummaryText) {
+            $rowGenSummary = $genText["Summary"];      $rowEditSummary = $editText["Summary"]
+            $rowGenReason = $genText["Reason"];        $rowEditReason = $editText["Reason"]
+            $rowGenResolution = $genText["Resolution"]; $rowEditResolution = $editText["Resolution"]
+            $rowGenFollowup = $genText["Followup"];    $rowEditFollowup = $editText["Followup"]
+        }
+
+        $detailRows += New-Object PSObject -Property @{
+            ConversationId           = $convId
+            ConversationStart        = [string]$conv.conversationStart
+            ConversationEnd          = [string]$conv.conversationEnd
+            MediaType                = $mediaType
+            Direction                = [string]$conv.originatingDirection
+            QueueId                  = $queueId
+            QueueName                = $queueName
+            AgentId                  = $agentId
+            AgentName                = $agentName
+            SummaryId                = $summaryId
+            Language                 = $language
+            WasEdited                = $wasEdited
+            EditedFieldList          = ($editedFields -join ";")
+            EditedFieldCount         = $editedFields.Count
+            SummaryGeneratedLen      = $metrics["Summary"]["GenLen"]
+            SummaryEditedLen         = $metrics["Summary"]["EditLen"]
+            SummaryLenDelta          = $metrics["Summary"]["Delta"]
+            SummaryWordOverlapPct    = $metrics["Summary"]["Overlap"]
+            ReasonGeneratedLen       = $metrics["Reason"]["GenLen"]
+            ReasonEditedLen          = $metrics["Reason"]["EditLen"]
+            ReasonLenDelta           = $metrics["Reason"]["Delta"]
+            ReasonWordOverlapPct     = $metrics["Reason"]["Overlap"]
+            ResolutionGeneratedLen   = $metrics["Resolution"]["GenLen"]
+            ResolutionEditedLen      = $metrics["Resolution"]["EditLen"]
+            ResolutionLenDelta       = $metrics["Resolution"]["Delta"]
+            ResolutionWordOverlapPct = $metrics["Resolution"]["Overlap"]
+            FollowupGeneratedLen     = $metrics["Followup"]["GenLen"]
+            FollowupEditedLen        = $metrics["Followup"]["EditLen"]
+            FollowupLenDelta         = $metrics["Followup"]["Delta"]
+            FollowupWordOverlapPct   = $metrics["Followup"]["Overlap"]
+            GeneratedSummaryText     = $rowGenSummary
+            EditedSummaryText        = $rowEditSummary
+            GeneratedReasonText      = $rowGenReason
+            EditedReasonText         = $rowEditReason
+            GeneratedResolutionText  = $rowGenResolution
+            EditedResolutionText     = $rowEditResolution
+            GeneratedFollowupText    = $rowGenFollowup
+            EditedFollowupText       = $rowEditFollowup
+        }
+    }
+}
+
+# ============================================================
+# EXPORTS
+# ============================================================
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$detailCsv = Join-Path $OutputFolder ("CopilotSummaries_Detail_" + $stamp + ".csv")
+$agentCsv  = Join-Path $OutputFolder ("CopilotEditRate_ByAgent_" + $stamp + ".csv")
+$queueCsv  = Join-Path $OutputFolder ("CopilotEditRate_ByQueue_" + $stamp + ".csv")
+$fieldCsv  = Join-Path $OutputFolder ("CopilotEditPatterns_ByField_" + $stamp + ".csv")
+
+# --- 1. Detail (one row per summary, edited or not) ---
+$detailColumns = @(
+    "ConversationId","ConversationStart","ConversationEnd","MediaType","Direction",
+    "QueueId","QueueName","AgentId","AgentName","SummaryId","Language",
+    "WasEdited","EditedFieldList","EditedFieldCount",
+    "SummaryGeneratedLen","SummaryEditedLen","SummaryLenDelta","SummaryWordOverlapPct",
+    "ReasonGeneratedLen","ReasonEditedLen","ReasonLenDelta","ReasonWordOverlapPct",
+    "ResolutionGeneratedLen","ResolutionEditedLen","ResolutionLenDelta","ResolutionWordOverlapPct",
+    "FollowupGeneratedLen","FollowupEditedLen","FollowupLenDelta","FollowupWordOverlapPct",
+    "GeneratedSummaryText","EditedSummaryText","GeneratedReasonText","EditedReasonText",
+    "GeneratedResolutionText","EditedResolutionText","GeneratedFollowupText","EditedFollowupText"
+)
+if ($detailRows.Count -gt 0) {
+    $detailRows | Select-Object $detailColumns | Export-Csv -Path $detailCsv -NoTypeInformation -Encoding UTF8
+} else {
+    # Header-only CSV keeps downstream Power Automate / Power BI refreshes stable
+    ('"' + ($detailColumns -join '","') + '"') | Out-File -FilePath $detailCsv -Encoding UTF8
+}
+
+# --- 2. Per-agent rollup ---
+$agentRows = @()
+foreach ($key in $agentStats.Keys) {
+    $as = $agentStats[$key]
+    $agentRows += New-Object PSObject -Property @{
+        AgentId            = $key
+        AgentName          = $as["AgentName"]
+        TotalSummaries     = $as["Total"]
+        EditedSummaries    = $as["Edited"]
+        EditRatePct        = (Get-Pct -Numerator $as["Edited"] -Denominator $as["Total"])
+        SummaryFieldEdits  = $as["SummaryEdits"]
+        ReasonFieldEdits   = $as["ReasonEdits"]
+        ResolutionFieldEdits = $as["ResolutionEdits"]
+        FollowupFieldEdits = $as["FollowupEdits"]
+        AvgLenDelta        = (Get-Avg -Sum $as["DeltaSum"] -Count $as["DeltaCount"])
+        AvgWordOverlapPct  = (Get-Avg -Sum $as["OverlapSum"] -Count $as["OverlapCount"])
+    }
+}
+$agentColumns = @("AgentId","AgentName","TotalSummaries","EditedSummaries","EditRatePct",
+    "SummaryFieldEdits","ReasonFieldEdits","ResolutionFieldEdits","FollowupFieldEdits",
+    "AvgLenDelta","AvgWordOverlapPct")
+if ($agentRows.Count -gt 0) {
+    $agentRows | Sort-Object -Property EditRatePct -Descending | Select-Object $agentColumns |
+        Export-Csv -Path $agentCsv -NoTypeInformation -Encoding UTF8
+} else {
+    ('"' + ($agentColumns -join '","') + '"') | Out-File -FilePath $agentCsv -Encoding UTF8
+}
+
+# --- 3. Per-queue rollup ---
+$queueRows = @()
+foreach ($key in $queueStats.Keys) {
+    $qs = $queueStats[$key]
+    $queueRows += New-Object PSObject -Property @{
+        QueueId         = $key
+        QueueName       = $qs["QueueName"]
+        TotalSummaries  = $qs["Total"]
+        EditedSummaries = $qs["Edited"]
+        EditRatePct     = (Get-Pct -Numerator $qs["Edited"] -Denominator $qs["Total"])
+    }
+}
+$queueColumns = @("QueueId","QueueName","TotalSummaries","EditedSummaries","EditRatePct")
+if ($queueRows.Count -gt 0) {
+    $queueRows | Sort-Object -Property EditRatePct -Descending | Select-Object $queueColumns |
+        Export-Csv -Path $queueCsv -NoTypeInformation -Encoding UTF8
+} else {
+    ('"' + ($queueColumns -join '","') + '"') | Out-File -FilePath $queueCsv -Encoding UTF8
+}
+
+# --- 4. Per-field content patterns ---
+$fieldRows = @()
+foreach ($fn in $fieldNames) {
+    $fs = $fieldStats[$fn]
+    $fieldRows += New-Object PSObject -Property @{
+        Field              = $fn
+        TotalGenerated     = $fs["Total"]
+        Edited             = $fs["Edited"]
+        EditRatePct        = (Get-Pct -Numerator $fs["Edited"] -Denominator $fs["Total"])
+        AvgGeneratedLen    = (Get-Avg -Sum $fs["GenLenSum"] -Count $fs["Total"])
+        AvgEditedLen       = (Get-Avg -Sum $fs["EditLenSum"] -Count $fs["Edited"])
+        AvgLenDelta        = (Get-Avg -Sum $fs["DeltaSum"] -Count $fs["Edited"])
+        AvgWordOverlapPct  = (Get-Avg -Sum $fs["OverlapSum"] -Count $fs["OverlapCount"])
+    }
+}
+$fieldColumns = @("Field","TotalGenerated","Edited","EditRatePct",
+    "AvgGeneratedLen","AvgEditedLen","AvgLenDelta","AvgWordOverlapPct")
+$fieldRows | Select-Object $fieldColumns | Export-Csv -Path $fieldCsv -NoTypeInformation -Encoding UTF8
+
+# ============================================================
+# CONSOLE SUMMARY
+# ============================================================
+$elapsed = (Get-Date) - $runStart
+$elapsedMin = [int]($elapsed.TotalMinutes * 10) / 10
+Write-Host ""
+Write-Host "==================== RUN SUMMARY ====================" -ForegroundColor Cyan
+Write-Host ("Window                     : last " + $DaysBack + " day(s)")
+Write-Host ("Conversations scanned      : " + $conversations.Count)
+Write-Host ("Conversations w/ summaries : " + $convWithSummary)
+Write-Host ("Total Copilot summaries    : " + $totalSummaries)
+Write-Host ("Edited summaries           : " + $editedSummaries)
+Write-Host ("Overall edit rate          : " + (Get-Pct -Numerator $editedSummaries -Denominator $totalSummaries) + " %")
+foreach ($fn in $fieldNames) {
+    $fs = $fieldStats[$fn]
+    Write-Host ("  " + $fn + " field edit rate : " + (Get-Pct -Numerator $fs["Edited"] -Denominator $fs["Total"]) + " %  (" + $fs["Edited"] + "/" + $fs["Total"] + ")")
+}
+Write-Host ("Elapsed                    : " + $elapsedMin + " min")
+Write-Host ""
+Write-Host "Outputs:" -ForegroundColor Green
+Write-Host ("  " + $detailCsv)
+Write-Host ("  " + $agentCsv)
+Write-Host ("  " + $queueCsv)
+Write-Host ("  " + $fieldCsv)
+Write-Host "=====================================================" -ForegroundColor Cyan
