@@ -391,6 +391,8 @@ $convWithSummary = 0
 $totalSummaries  = 0
 $editedSummaries = 0
 $processed       = 0
+$summary404      = 0   # summaries call returned 404 / not found
+$summaryEmpty    = 0   # summaries call returned 200 but no entities
 
 foreach ($conv in $conversations) {
     $processed++
@@ -427,15 +429,21 @@ foreach ($conv in $conversations) {
     # Fetch summaries (null = 404 / none)
     $sumResp = Invoke-GcApi -Method "Get" -Path ("/api/v2/conversations/" + $convId + "/summaries")
     if ($ThrottleMs -gt 0) { Start-Sleep -Milliseconds $ThrottleMs }
-    if (-not $sumResp) { continue }
+    if (-not $sumResp) { $summary404++; continue }
 
     $entities = $null
     try { $entities = $sumResp.entities } catch { $entities = $null }
     if (-not $entities) {
-        # Some payloads return the summary object(s) at the top level
-        if ($sumResp.id) { $entities = @($sumResp) } else { continue }
+        # Alternate shape: { summaries: [...] }
+        try { if ($sumResp.summaries) { $entities = $sumResp.summaries } } catch { }
     }
-    if ($entities.Count -eq 0) { continue }
+    if (-not $entities) {
+        # Alternate shape: bare object or bare array of summary objects
+        $first = $null
+        try { $first = $sumResp[0] } catch { $first = $null }
+        if ($first -and $first.id) { $entities = @($sumResp) }
+    }
+    if (-not $entities -or $entities.Count -eq 0) { $summaryEmpty++; continue }
 
     $convWithSummary++
     $agentName = Get-AgentName -UserId $agentId
@@ -698,6 +706,25 @@ Write-Host "==================== RUN SUMMARY ====================" -ForegroundCo
 Write-Host ("Window                     : last " + $DaysBack + " day(s)")
 Write-Host ("Conversations scanned      : " + $conversations.Count)
 Write-Host ("Conversations w/ summaries : " + $convWithSummary)
+Write-Host ("  - summaries 404/not found: " + $summary404)
+Write-Host ("  - summaries empty (200)  : " + $summaryEmpty)
+if ($convWithSummary -eq 0 -and $conversations.Count -gt 0) {
+    Write-Host ""
+    Write-Host "ZERO summaries found. Diagnostic hints:" -ForegroundColor Yellow
+    if ($summary404 -ge ($conversations.Count * 0.9)) {
+        Write-Host "  Nearly ALL calls returned 404. Likely causes:" -ForegroundColor Yellow
+        Write-Host "   1. OAuth client role is missing the Copilot summary view permission" -ForegroundColor Yellow
+        Write-Host "      (Genesys masks some permission failures as 404, not 403)." -ForegroundColor Yellow
+        Write-Host "   2. Role not assigned to the conversations' DIVISIONS." -ForegroundColor Yellow
+        Write-Host "   3. Scanned conversations are on queues without Agent Copilot" -ForegroundColor Yellow
+        Write-Host "      (note: Copilot is NOT available on BYOC Premises voice)." -ForegroundColor Yellow
+    } else {
+        Write-Host "  Calls succeeded but returned no summary entities - check the raw" -ForegroundColor Yellow
+        Write-Host "  response shape with the Diagnose-CopilotSummaryAccess.ps1 script." -ForegroundColor Yellow
+    }
+    Write-Host "  Run Diagnose-CopilotSummaryAccess.ps1 with a conversation ID where an" -ForegroundColor Yellow
+    Write-Host "  agent visibly saw a Copilot summary today." -ForegroundColor Yellow
+}
 Write-Host ("Total Copilot summaries    : " + $totalSummaries)
 Write-Host ("Edited summaries           : " + $editedSummaries)
 Write-Host ("Overall edit rate          : " + (Get-Pct -Numerator $editedSummaries -Denominator $totalSummaries) + " %")
