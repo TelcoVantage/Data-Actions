@@ -1,0 +1,362 @@
+<#
+.SYNOPSIS
+    Genesys Cloud (AU region) - Call Disconnect Reason Extractor
+.DESCRIPTION
+    Pulls conversation detail records from the Analytics Conversation Details Query API
+    and flattens every participant / session / segment into CSV rows, capturing
+    disconnectType (endpoint, client, system, error, peer, transfer, timeout,
+    transportFailure, etc.), errorCode, SIP response codes, wrap-up codes and more.
+
+    Written for Windows PowerShell 5.1 in CONSTRAINED LANGUAGE MODE:
+      - No .NET static method calls (Base64 is implemented in pure PowerShell)
+      - No ::new() constructors, no [pscustomobject] casts
+      - Plain arrays, hashtables, cmdlets and core-type casts only
+.NOTES
+    Region : Australia (ap-southeast-2) - mypurecloud.com.au
+    OAuth  : Client Credentials grant. The OAuth client's role needs
+             analytics:conversationDetail:view (e.g. via an Analytics role).
+#>
+
+# ============================================================
+# CONFIGURATION - EDIT THESE
+# ============================================================
+$ClientId     = "YOUR_CLIENT_ID_HERE"
+$ClientSecret = "YOUR_CLIENT_SECRET_HERE"
+
+$LoginBase = "https://login.mypurecloud.com.au"
+$ApiBase   = "https://api.mypurecloud.com.au"
+
+$DaysBack   = 7          # How far back to query (Analytics details query max interval = 31 days)
+$VoiceOnly  = $false     # $true = only voice/callback sessions; $false = all media types
+$PageSize   = 100        # Max 100 for details query
+$MaxPages   = 200        # Safety cap
+$OutputCsv  = ".\GenesysDisconnectReasons_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".csv"
+
+# ============================================================
+# PURE-POWERSHELL BASE64 ENCODER (CLM-safe, no [Convert]::)
+# ============================================================
+function ConvertTo-Base64Clm {
+    param([string]$Text)
+
+    $alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    $bytes = @()
+    foreach ($c in $Text.ToCharArray()) {
+        $bytes += [int]$c
+    }
+
+    $out = ""
+    $i = 0
+    while ($i -lt $bytes.Count) {
+        $b0 = $bytes[$i]
+        $b1 = -1
+        $b2 = -1
+        if (($i + 1) -lt $bytes.Count) { $b1 = $bytes[$i + 1] }
+        if (($i + 2) -lt $bytes.Count) { $b2 = $bytes[$i + 2] }
+
+        $out += [string]$alphabet[($b0 -shr 2) -band 63]
+
+        if ($b1 -ge 0) {
+            $out += [string]$alphabet[(($b0 -shl 4) -bor ($b1 -shr 4)) -band 63]
+            if ($b2 -ge 0) {
+                $out += [string]$alphabet[(($b1 -shl 2) -bor ($b2 -shr 6)) -band 63]
+                $out += [string]$alphabet[$b2 -band 63]
+            }
+            else {
+                $out += [string]$alphabet[($b1 -shl 2) -band 63]
+                $out += "="
+            }
+        }
+        else {
+            $out += [string]$alphabet[($b0 -shl 4) -band 63]
+            $out += "=="
+        }
+        $i += 3
+    }
+    return $out
+}
+
+# ============================================================
+# HTTP HELPER WITH 429 RETRY (CLM-safe error handling)
+# ============================================================
+function Invoke-GcApi {
+    param(
+        [string]$Method,
+        [string]$Uri,
+        [hashtable]$Headers,
+        [string]$Body
+    )
+
+    $attempt = 0
+    while ($attempt -lt 5) {
+        $attempt++
+        try {
+            if ($Body) {
+                return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers -Body $Body -ContentType "application/json"
+            }
+            else {
+                return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers
+            }
+        }
+        catch {
+            $status = 0
+            try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+
+            if ($status -eq 429 -or ($_.Exception.Message -like "*429*")) {
+                Write-Warning ("Rate limited (429). Sleeping 35s then retrying (attempt " + $attempt + " of 5)...")
+                Start-Sleep -Seconds 35
+                continue
+            }
+            elseif ($status -eq 401 -or ($_.Exception.Message -like "*401*")) {
+                Write-Error ("401 Unauthorized calling " + $Uri + " - check client credentials / role permissions.")
+                throw
+            }
+            else {
+                Write-Error ("API call failed (" + $status + "): " + $_.Exception.Message)
+                throw
+            }
+        }
+    }
+    throw "Exceeded retry limit for $Uri"
+}
+
+# ============================================================
+# 1. AUTHENTICATE (Client Credentials grant)
+# ============================================================
+Write-Host "Authenticating against $LoginBase ..." -ForegroundColor Cyan
+
+$basicAuth = ConvertTo-Base64Clm ($ClientId + ":" + $ClientSecret)
+
+$tokenResponse = $null
+try {
+    $tokenResponse = Invoke-RestMethod -Method Post `
+        -Uri ($LoginBase + "/oauth/token") `
+        -Headers @{ Authorization = ("Basic " + $basicAuth) } `
+        -Body "grant_type=client_credentials" `
+        -ContentType "application/x-www-form-urlencoded"
+}
+catch {
+    $status = 0
+    try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+    Write-Error ("Token request failed (HTTP " + $status + "): " + $_.Exception.Message)
+    exit 1
+}
+
+if (-not $tokenResponse -or -not $tokenResponse.access_token) {
+    Write-Error "No access_token returned - aborting. Check Client ID / Secret and that the OAuth client is a Client Credentials grant."
+    exit 1
+}
+
+$authHeaders = @{
+    Authorization  = ("Bearer " + [string]$tokenResponse.access_token)
+    "Content-Type" = "application/json"
+}
+Write-Host "Authenticated OK (token expires in $($tokenResponse.expires_in)s)." -ForegroundColor Green
+
+# ============================================================
+# 2. BUILD INTERVAL (UTC ISO-8601)
+# ============================================================
+$endUtc   = (Get-Date).ToUniversalTime()
+$startUtc = $endUtc.AddDays(-1 * $DaysBack)
+
+$intervalStart = $startUtc.ToString("yyyy-MM-ddTHH:mm:ss") + ".000Z"
+$intervalEnd   = $endUtc.ToString("yyyy-MM-ddTHH:mm:ss") + ".000Z"
+$interval      = $intervalStart + "/" + $intervalEnd
+
+Write-Host ("Query interval (UTC): " + $interval) -ForegroundColor Cyan
+
+# ============================================================
+# 3. QUERY ANALYTICS CONVERSATION DETAILS (paged)
+# ============================================================
+$allConversations = @()
+$pageNumber = 1
+
+while ($pageNumber -le $MaxPages) {
+
+    $queryBody = @{
+        interval = $interval
+        order    = "asc"
+        orderBy  = "conversationStart"
+        paging   = @{
+            pageSize   = $PageSize
+            pageNumber = $pageNumber
+        }
+    }
+
+    $bodyJson = $queryBody | ConvertTo-Json -Depth 10
+
+    Write-Host ("Fetching page " + $pageNumber + " ...")
+    $result = Invoke-GcApi -Method "Post" -Uri ($ApiBase + "/api/v2/analytics/conversations/details/query") -Headers $authHeaders -Body $bodyJson
+
+    if (-not $result -or -not $result.conversations) {
+        Write-Host "No more conversations returned."
+        break
+    }
+
+    $batch = @($result.conversations)
+    $allConversations += $batch
+    Write-Host ("  Retrieved " + $batch.Count + " conversations (running total: " + $allConversations.Count + ")")
+
+    if ($batch.Count -lt $PageSize) { break }
+    $pageNumber++
+}
+
+Write-Host ("Total conversations retrieved: " + $allConversations.Count) -ForegroundColor Green
+
+if ($allConversations.Count -eq 0) {
+    Write-Warning "Nothing to export - no conversations in the interval."
+    exit 0
+}
+
+# ============================================================
+# 4. FLATTEN: one CSV row per SEGMENT (most granular level)
+#    Disconnect data lives at both session and segment level.
+# ============================================================
+$rows = @()
+
+foreach ($conv in $allConversations) {
+
+    $convId    = [string]$conv.conversationId
+    $convStart = [string]$conv.conversationStart
+    $convEnd   = [string]$conv.conversationEnd
+    $origDir   = [string]$conv.originatingDirection
+    $divisions = ""
+    if ($conv.divisionIds) { $divisions = ($conv.divisionIds -join ";") }
+
+    foreach ($part in @($conv.participants)) {
+
+        $participantId   = [string]$part.participantId
+        $participantName = [string]$part.participantName
+        $purpose         = [string]$part.purpose
+        $userId          = [string]$part.userId
+        $externalOrg     = [string]$part.externalOrganizationId
+
+        foreach ($sess in @($part.sessions)) {
+
+            $mediaType = [string]$sess.mediaType
+
+            if ($VoiceOnly -and ($mediaType -ne "voice") -and ($mediaType -ne "callback")) { continue }
+
+            $sipCodes  = ""
+            $q850Codes = ""
+            if ($sess.sipResponseCodes)  { $sipCodes  = ($sess.sipResponseCodes -join ";") }
+            if ($sess.q850ResponseCodes) { $q850Codes = ($sess.q850ResponseCodes -join ";") }
+
+            $flowOutcome = ""
+            if ($sess.flow -and $sess.flow.exitReason) { $flowOutcome = [string]$sess.flow.exitReason }
+
+            # Session-level metadata
+            $sessionCommon = @{
+                ConversationId        = $convId
+                ConversationStart     = $convStart
+                ConversationEnd       = $convEnd
+                OriginatingDirection  = $origDir
+                DivisionIds           = $divisions
+                ParticipantId         = $participantId
+                ParticipantName       = $participantName
+                Purpose               = $purpose
+                UserId                = $userId
+                ExternalOrgId         = $externalOrg
+                SessionId             = [string]$sess.sessionId
+                MediaType             = $mediaType
+                Direction             = [string]$sess.direction
+                ANI                   = [string]$sess.ani
+                DNIS                  = [string]$sess.dnis
+                SessionDNIS           = [string]$sess.sessionDnis
+                EdgeId                = [string]$sess.edgeId
+                Provider              = [string]$sess.provider
+                Remote                = [string]$sess.remote
+                RemoteNameDisplayable = [string]$sess.remoteNameDisplayable
+                ProtocolCallId        = [string]$sess.protocolCallId
+                PeerId                = [string]$sess.peerId
+                Recording             = [string]$sess.recording
+                SIPResponseCodes      = $sipCodes
+                Q850ResponseCodes     = $q850Codes
+                FlowExitReason        = $flowOutcome
+            }
+
+            $segments = @($sess.segments)
+
+            if ($segments.Count -eq 0) {
+                # No segments - still emit a session-level row
+                $rowProps = @{} + $sessionCommon
+                $rowProps["SegmentStart"]          = ""
+                $rowProps["SegmentEnd"]            = ""
+                $rowProps["SegmentType"]           = ""
+                $rowProps["SegmentDisconnectType"] = ""
+                $rowProps["ErrorCode"]             = ""
+                $rowProps["QueueId"]               = ""
+                $rowProps["WrapUpCode"]            = ""
+                $rowProps["Conference"]            = ""
+                $rows += New-Object PSObject -Property $rowProps
+            }
+            else {
+                foreach ($seg in $segments) {
+                    $rowProps = @{} + $sessionCommon
+                    $rowProps["SegmentStart"]          = [string]$seg.segmentStart
+                    $rowProps["SegmentEnd"]            = [string]$seg.segmentEnd
+                    $rowProps["SegmentType"]           = [string]$seg.segmentType
+                    $rowProps["SegmentDisconnectType"] = [string]$seg.disconnectType
+                    $rowProps["ErrorCode"]             = [string]$seg.errorCode
+                    $rowProps["QueueId"]               = [string]$seg.queueId
+                    $rowProps["WrapUpCode"]            = [string]$seg.wrapUpCode
+                    $rowProps["Conference"]            = [string]$seg.conference
+                    $rows += New-Object PSObject -Property $rowProps
+                }
+            }
+        }
+    }
+}
+
+Write-Host ("Flattened rows (segment level): " + $rows.Count) -ForegroundColor Green
+
+# ============================================================
+# 5. EXPORT CSV (explicit column order - required because
+#    New-Object -Property hashtables do not preserve order)
+# ============================================================
+$rows |
+    Select-Object ConversationId, ConversationStart, ConversationEnd, OriginatingDirection, DivisionIds, `
+                  ParticipantId, ParticipantName, Purpose, UserId, ExternalOrgId, `
+                  SessionId, MediaType, Direction, ANI, DNIS, SessionDNIS, `
+                  SegmentStart, SegmentEnd, SegmentType, SegmentDisconnectType, ErrorCode, `
+                  QueueId, WrapUpCode, Conference, `
+                  EdgeId, Provider, Remote, RemoteNameDisplayable, ProtocolCallId, PeerId, `
+                  Recording, SIPResponseCodes, Q850ResponseCodes, FlowExitReason |
+    Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+
+Write-Host ("Exported: " + $OutputCsv) -ForegroundColor Green
+
+# ============================================================
+# 6. CONSOLE SUMMARY - disconnect type breakdown
+# ============================================================
+Write-Host ""
+Write-Host "=== Disconnect Type Summary (segment level, disconnect segments only) ===" -ForegroundColor Cyan
+
+$disconnectRows = @($rows | Where-Object { $_.SegmentDisconnectType -and $_.SegmentDisconnectType -ne "" })
+
+$disconnectRows |
+    Group-Object SegmentDisconnectType |
+    Sort-Object Count -Descending |
+    Select-Object @{ Name = "DisconnectType"; Expression = { $_.Name } }, Count |
+    Format-Table -AutoSize
+
+Write-Host "=== Disconnect Type by Participant Purpose ===" -ForegroundColor Cyan
+$disconnectRows |
+    Group-Object Purpose, SegmentDisconnectType |
+    Sort-Object Count -Descending |
+    Select-Object @{ Name = "Purpose / DisconnectType"; Expression = { $_.Name } }, Count |
+    Format-Table -AutoSize
+
+$errorRows = @($rows | Where-Object { $_.ErrorCode -and $_.ErrorCode -ne "" })
+if ($errorRows.Count -gt 0) {
+    Write-Host "=== Error Codes Detected ===" -ForegroundColor Yellow
+    $errorRows |
+        Group-Object ErrorCode |
+        Sort-Object Count -Descending |
+        Select-Object @{ Name = "ErrorCode"; Expression = { $_.Name } }, Count |
+        Format-Table -AutoSize
+}
+else {
+    Write-Host "No errorCode values found in this interval." -ForegroundColor Green
+}
+
+Write-Host "Done." -ForegroundColor Green
