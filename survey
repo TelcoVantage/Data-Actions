@@ -241,7 +241,7 @@ foreach ($conv in $conversations) {
                         $outcomeStr += ("" + $o.flowOutcome + ":" + $o.flowOutcomeValue)
                     }
                 }
-                $fs = [pscustomobject]@{
+                $fs = New-Object PSObject -Property @{
                     FlowName    = $s.flow.flowName
                     FlowVersion = $s.flow.flowVersion
                     EntryReason = $s.flow.entryReason
@@ -298,7 +298,7 @@ foreach ($conv in $conversations) {
                                 }
                             }
                         }
-                        $answerRows += [pscustomobject]@{
+                        $answerRows += New-Object PSObject -Property @{
                             ConversationId    = $convId
                             ConversationStart = $conv.conversationStart
                             SurveyForm        = $surveyFormName
@@ -325,7 +325,7 @@ foreach ($conv in $conversations) {
         foreach ($p in $fullConv.participants) {
             if ($p.attributes) {
                 foreach ($prop in $p.attributes.PSObject.Properties) {
-                    $attrRows += [pscustomobject]@{
+                    $attrRows += New-Object PSObject -Property @{
                         ConversationId = $convId
                         Participant    = $p.purpose
                         AttributeName  = $prop.Name
@@ -337,7 +337,7 @@ foreach ($conv in $conversations) {
     }
 
     # ---- Conversation-level summary row ----
-    $convRows += [pscustomobject]@{
+    $convRows += New-Object PSObject -Property @{
         ConversationId    = $convId
         ConversationStart = $conv.conversationStart
         ConversationEnd   = $conv.conversationEnd
@@ -370,9 +370,17 @@ $convCsv = Join-Path $OutDir "SurveyConversations.csv"
 $ansCsv  = Join-Path $OutDir "SurveyAnswers.csv"
 $attrCsv = Join-Path $OutDir "ParticipantAttributes.csv"
 
-$convRows   | Export-Csv $convCsv -NoTypeInformation -Encoding UTF8
-$answerRows | Export-Csv $ansCsv  -NoTypeInformation -Encoding UTF8
-$attrRows   | Export-Csv $attrCsv -NoTypeInformation -Encoding UTF8
+$convRows | Select-Object ConversationId, ConversationStart, ConversationEnd, Direction, ANI, DNIS, `
+    QueueParticipant, AgentUserId, SurveyFlowName, SurveyFlowVersion, FlowEntryReason, FlowEntryType, `
+    FlowExitReason, FlowOutcomes, SurveyForm, SurveyStatus, SurveyTotalScore, NpsScore |
+    Export-Csv $convCsv -NoTypeInformation -Encoding UTF8
+
+$answerRows | Select-Object ConversationId, ConversationStart, SurveyForm, SurveyStatus, QuestionGroupId, `
+    QuestionId, QuestionText, AnswerId, AnswerText, Score, NpsScore, FreeTextAnswer, MarkedNA |
+    Export-Csv $ansCsv -NoTypeInformation -Encoding UTF8
+
+$attrRows | Select-Object ConversationId, Participant, AttributeName, AttributeValue |
+    Export-Csv $attrCsv -NoTypeInformation -Encoding UTF8
 
 Write-Host ""
 Write-Host "=== EXPORT COMPLETE ===" -ForegroundColor Green
