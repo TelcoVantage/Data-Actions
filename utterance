@@ -1,19 +1,22 @@
 <#
 .SYNOPSIS
-    Extracts Genesys Cloud flow execution history (bot flow sessions) and utterance
-    history (reporting turns) for a given flow ID, exporting everything to CSV.
+    Genesys Cloud VOICE SURVEY flow extraction (AU region).
+    Produces three CSVs:
+      1. SurveyResults  - ONE ROW PER SURVEY SESSION, pivoted so each question is
+                          its own column set (Question / Prompt / Answer / Confidence /
+                          Result / Attempts / Timestamp). Easiest to read.
+      2. Sessions       - raw flow execution history (one row per session).
+      3. Utterances     - raw reporting turns (one row per turn), full detail.
 
 .NOTES
     Region  : Australia (mypurecloud.com.au)
-    APIs    : GET /api/v2/analytics/botflows/{botFlowId}/sessions
-              GET /api/v2/analytics/botflows/{botFlowId}/reportingturns
+    APIs    : GET  /api/v2/analytics/botflows/{flowId}/sessions
+              GET  /api/v2/analytics/botflows/{flowId}/reportingturns
+              POST /api/v2/analytics/conversations/details/query   (optional enrichment)
     Perms   : analytics:botFlowSession:view
               analytics:botFlowReportingTurn:view
+              analytics:conversationDetail:view   (only if $IncludeConversationDetails)
     CLM-safe: No .NET static methods, no ::new(), no [pscustomobject] casts.
-              Base64 implemented in pure PowerShell with bit operators.
-    Note    : These endpoints only return data for BOT-type flows (Bot Flow,
-              Digital Bot Flow, Voice Bot). Utterance history only exists for
-              bot flows - non-bot flows (e.g. Inbound Call) will return 400/404.
 #>
 
 # ============================================================
@@ -21,10 +24,12 @@
 # ============================================================
 $ClientId     = "YOUR_CLIENT_ID_HERE"
 $ClientSecret = "YOUR_CLIENT_SECRET_HERE"
-$FlowId       = "YOUR_FLOW_ID_HERE"      # Bot flow ID (GUID)
-$DaysBack     = 7                         # Lookback window for the interval
+$FlowId       = "YOUR_FLOW_ID_HERE"      # Voice survey flow ID (GUID)
+$DaysBack     = 7                         # Lookback window
 $PageSize     = 100
-$OutputFolder = "C:\Temp"                 # CSVs written here
+$MaxQuestions = 2                         # Number of Q_ column sets in SurveyResults CSV
+$IncludeConversationDetails = $true       # Adds ANI / DNIS / Direction / Conversation timings
+$OutputFolder = "C:\Temp"
 
 $LoginBase = "https://login.mypurecloud.com.au"
 $ApiBase   = "https://api.mypurecloud.com.au"
@@ -49,14 +54,10 @@ function ConvertTo-Base64String {
 
         if (($i + 1) -lt $bytes.Count) {
             $result += $alphabet[(($b1 -shl 2) -bor ($b2 -shr 6)) -band 63]
-        } else {
-            $result += "="
-        }
+        } else { $result += "=" }
         if (($i + 2) -lt $bytes.Count) {
             $result += $alphabet[$b2 -band 63]
-        } else {
-            $result += "="
-        }
+        } else { $result += "=" }
         $i += 3
     }
     return $result
@@ -66,7 +67,6 @@ function ConvertTo-Base64String {
 # HELPERS
 # ============================================================
 function Get-AfterCursor {
-    # Extracts the 'after' cursor value from a nextUri string (no [uri]:: usage)
     param([string]$NextUri)
     if (-not $NextUri) { return $null }
     $idx = $NextUri.IndexOf("after=")
@@ -78,19 +78,22 @@ function Get-AfterCursor {
     return $val
 }
 
-function Invoke-GenesysGet {
-    # GET with token header, 429 retry, CLM-safe error handling
+function Invoke-GenesysApi {
     param(
+        [string]$Method,
         [string]$Uri,
-        [hashtable]$Headers
+        [hashtable]$Headers,
+        [string]$Body
     )
     $maxRetries = 5
     $attempt = 0
     while ($true) {
         $attempt++
         try {
-            $resp = Invoke-RestMethod -Method Get -Uri $Uri -Headers $Headers -ErrorAction Stop
-            return $resp
+            if ($Method -eq "POST") {
+                return Invoke-RestMethod -Method Post -Uri $Uri -Headers $Headers -ContentType "application/json" -Body $Body -ErrorAction Stop
+            }
+            return Invoke-RestMethod -Method Get -Uri $Uri -Headers $Headers -ErrorAction Stop
         }
         catch {
             $status = 0
@@ -102,20 +105,19 @@ function Invoke-GenesysGet {
                 elseif ($_.Exception.Message -like "*404*") { $status = 404 }
             }
             if ($status -eq 429 -and $attempt -le $maxRetries) {
-                Write-Host ("  Rate limited (429). Waiting 20s then retrying (attempt {0}/{1})..." -f $attempt, $maxRetries) -ForegroundColor Yellow
+                Write-Host ("  Rate limited (429). Waiting 20s, retry {0}/{1}..." -f $attempt, $maxRetries) -ForegroundColor Yellow
                 Start-Sleep -Seconds 20
                 continue
             }
             if ($status -eq 401) { throw "HTTP 401 Unauthorized - token invalid/expired. Check client credentials." }
-            if ($status -eq 403) { throw "HTTP 403 Forbidden - OAuth client role is missing analytics:botFlowSession:view / analytics:botFlowReportingTurn:view." }
-            if ($status -eq 404) { throw "HTTP 404 Not Found - check the Flow ID. Note: these endpoints only work for BOT flows (Bot Flow / Digital Bot Flow / Voice Bot)." }
+            if ($status -eq 403) { throw "HTTP 403 Forbidden - OAuth client role is missing a required analytics permission." }
+            if ($status -eq 404) { throw "HTTP 404 Not Found - check the Flow ID (must be a bot-type flow, e.g. voice survey)." }
             throw ("Request failed (HTTP {0}) for {1} : {2}" -f $status, $Uri, $_.Exception.Message)
         }
     }
 }
 
 function Join-StringArray {
-    # Safely joins an array of strings (bot prompts etc.) into one pipe-delimited string
     param($Items)
     if ($null -eq $Items) { return "" }
     $out = ""
@@ -126,8 +128,20 @@ function Join-StringArray {
     return $out
 }
 
+function Get-UserInputText {
+    # userInput may be a plain string (utterance / DTMF digits) or a nested object
+    param($UserInput)
+    if ($null -eq $UserInput) { return "" }
+    if ($UserInput -is [string]) { return $UserInput }
+    # Guarded probes for common nested field names across schema versions
+    if ($UserInput.text)      { return [string]$UserInput.text }
+    if ($UserInput.utterance) { return [string]$UserInput.utterance }
+    if ($UserInput.dtmf)      { return ("DTMF: " + [string]$UserInput.dtmf) }
+    return (ConvertTo-Json -InputObject $UserInput -Depth 10 -Compress)
+}
+
 # ============================================================
-# STEP 1 - AUTHENTICATE (client credentials)
+# STEP 1 - AUTHENTICATE
 # ============================================================
 Write-Host "Authenticating to Genesys Cloud (AU region)..." -ForegroundColor Cyan
 
@@ -155,24 +169,24 @@ Write-Host "Authenticated OK." -ForegroundColor Green
 $apiHeaders = @{ Authorization = ("Bearer " + $token.access_token) }
 
 # ============================================================
-# STEP 2 - BUILD INTERVAL (last N days, UTC, ISO-8601)
+# STEP 2 - INTERVAL + OUTPUT PATHS
 # ============================================================
 $nowUtc   = (Get-Date).ToUniversalTime()
 $startUtc = $nowUtc.AddDays(-1 * $DaysBack)
-$intervalStart = Get-Date -Date $startUtc -Format "yyyy-MM-ddTHH:mm:ss"
-$intervalEnd   = Get-Date -Date $nowUtc   -Format "yyyy-MM-ddTHH:mm:ss"
-$interval = $intervalStart + ".000Z/" + $intervalEnd + ".000Z"
+$interval = (Get-Date -Date $startUtc -Format "yyyy-MM-ddTHH:mm:ss") + ".000Z/" + `
+            (Get-Date -Date $nowUtc   -Format "yyyy-MM-ddTHH:mm:ss") + ".000Z"
 Write-Host ("Interval: " + $interval)
 
-$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$sessionsCsv   = $OutputFolder + "\GenesysFlowSessions_"   + $stamp + ".csv"
-$utterancesCsv = $OutputFolder + "\GenesysFlowUtterances_" + $stamp + ".csv"
+$stamp         = Get-Date -Format "yyyyMMdd_HHmmss"
+$surveyCsv     = $OutputFolder + "\GenesysVoiceSurvey_Results_"    + $stamp + ".csv"
+$sessionsCsv   = $OutputFolder + "\GenesysVoiceSurvey_Sessions_"   + $stamp + ".csv"
+$utterancesCsv = $OutputFolder + "\GenesysVoiceSurvey_Utterances_" + $stamp + ".csv"
 
 # ============================================================
-# STEP 3 - GET ALL BOT FLOW SESSIONS (flow execution history)
+# STEP 3 - GET ALL SESSIONS
 # ============================================================
 Write-Host ""
-Write-Host "Fetching flow execution sessions..." -ForegroundColor Cyan
+Write-Host "Fetching survey flow sessions..." -ForegroundColor Cyan
 
 $allSessions = @()
 $after = $null
@@ -181,22 +195,15 @@ do {
     $page++
     $uri = $ApiBase + "/api/v2/analytics/botflows/" + $FlowId + "/sessions?pageSize=" + $PageSize + "&interval=" + $interval
     if ($after) { $uri += "&after=" + $after }
-
-    $resp = Invoke-GenesysGet -Uri $uri -Headers $apiHeaders
-
-    $count = 0
-    if ($resp.entities) {
-        foreach ($e in $resp.entities) { $allSessions += $e; $count++ }
-    }
-    Write-Host ("  Page {0}: {1} sessions (running total {2})" -f $page, $count, $allSessions.Count)
-
+    $resp = Invoke-GenesysApi -Method "GET" -Uri $uri -Headers $apiHeaders
+    if ($resp.entities) { foreach ($e in $resp.entities) { $allSessions += $e } }
+    Write-Host ("  Page {0} - running total {1}" -f $page, $allSessions.Count)
     $after = Get-AfterCursor -NextUri $resp.nextUri
 } while ($after)
-
-Write-Host ("Total sessions retrieved: " + $allSessions.Count) -ForegroundColor Green
+Write-Host ("Total sessions: " + $allSessions.Count) -ForegroundColor Green
 
 # ============================================================
-# STEP 4 - GET ALL REPORTING TURNS (utterance history)
+# STEP 4 - GET ALL REPORTING TURNS (utterances)
 # ============================================================
 Write-Host ""
 Write-Host "Fetching utterance history (reporting turns)..." -ForegroundColor Cyan
@@ -208,30 +215,21 @@ do {
     $page++
     $uri = $ApiBase + "/api/v2/analytics/botflows/" + $FlowId + "/reportingturns?pageSize=" + $PageSize + "&interval=" + $interval
     if ($after) { $uri += "&after=" + $after }
-
-    $resp = Invoke-GenesysGet -Uri $uri -Headers $apiHeaders
-
-    $count = 0
-    if ($resp.entities) {
-        foreach ($e in $resp.entities) { $allTurns += $e; $count++ }
-    }
-    Write-Host ("  Page {0}: {1} turns (running total {2})" -f $page, $count, $allTurns.Count)
-
+    $resp = Invoke-GenesysApi -Method "GET" -Uri $uri -Headers $apiHeaders
+    if ($resp.entities) { foreach ($e in $resp.entities) { $allTurns += $e } }
+    Write-Host ("  Page {0} - running total {1}" -f $page, $allTurns.Count)
     $after = Get-AfterCursor -NextUri $resp.nextUri
 } while ($after)
-
-Write-Host ("Total reporting turns retrieved: " + $allTurns.Count) -ForegroundColor Green
+Write-Host ("Total turns: " + $allTurns.Count) -ForegroundColor Green
 
 # ============================================================
-# STEP 5 - FLATTEN SESSIONS TO CSV
+# STEP 5 - FLATTEN SESSIONS (raw CSV #2) + build lookup
 # ============================================================
 Write-Host ""
 Write-Host "Flattening session data..." -ForegroundColor Cyan
 
 $sessionRows = @()
 foreach ($s in $allSessions) {
-
-    # Session ID field name can vary between schema versions - guard both
     $sid = $null
     if ($s.sessionId) { $sid = $s.sessionId } elseif ($s.id) { $sid = $s.id }
 
@@ -239,8 +237,7 @@ foreach ($s in $allSessions) {
     if ($s.conversationId) { $convId = $s.conversationId }
     elseif ($s.conversation -and $s.conversation.id) { $convId = $s.conversation.id }
 
-    $endType = ""
-    $endReason = ""
+    $endType = ""; $endReason = ""
     if ($s.sessionEndDetails) {
         foreach ($d in @($s.sessionEndDetails)) {
             if ($endType -ne "")   { $endType += " | " }
@@ -250,21 +247,17 @@ foreach ($s in $allSessions) {
         }
     }
 
-    $askResults = ""
-    if ($s.askActionResults) { $askResults = Join-StringArray -Items $s.askActionResults }
-
     $row = New-Object PSObject -Property @{
         SessionId          = $sid
         ConversationId     = $convId
         FlowId             = $FlowId
         MediaType          = [string]$s.mediaType
-        Channels           = (Join-StringArray -Items $s.channels)
         BotResult          = [string]$s.botResult
         BotResultCategory  = [string]$s.botResultCategory
         EndLanguage        = [string]$s.endLanguage
         SessionEndType     = $endType
         SessionEndReason   = $endReason
-        AskActionResults   = $askResults
+        AskActionResults   = (Join-StringArray -Items $s.askActionResults)
         SelfServed         = [string]$s.selfServed
         SessionStartTime   = [string]$s.startTime
         SessionEndTime     = [string]$s.endTime
@@ -274,23 +267,6 @@ foreach ($s in $allSessions) {
     $sessionRows += $row
 }
 
-if ($sessionRows.Count -gt 0) {
-    $sessionRows |
-        Select-Object SessionId, ConversationId, FlowId, MediaType, Channels, BotResult, `
-            BotResultCategory, EndLanguage, SessionEndType, SessionEndReason, AskActionResults, `
-            SelfServed, SessionStartTime, SessionEndTime, SessionDurationSec, RawJson |
-        Export-Csv -Path $sessionsCsv -NoTypeInformation -Encoding UTF8
-    Write-Host ("Sessions CSV written: " + $sessionsCsv) -ForegroundColor Green
-} else {
-    Write-Host "No sessions found in the interval - sessions CSV not written." -ForegroundColor Yellow
-}
-
-# ============================================================
-# STEP 6 - FLATTEN REPORTING TURNS (UTTERANCES) TO CSV
-# ============================================================
-Write-Host "Flattening utterance data..." -ForegroundColor Cyan
-
-# Build a session lookup so each utterance row also carries session outcome info
 $sessionLookup = @{}
 foreach ($sr in $sessionRows) {
     if ($sr.SessionId -and -not $sessionLookup.ContainsKey([string]$sr.SessionId)) {
@@ -298,38 +274,31 @@ foreach ($sr in $sessionRows) {
     }
 }
 
-$turnRows = @()
-foreach ($t in $allTurns) {
+# ============================================================
+# STEP 6 - FLATTEN TURNS (raw CSV #3) + group by session
+# ============================================================
+Write-Host "Flattening utterance data..." -ForegroundColor Cyan
 
+$turnRows = @()
+$turnsBySession = @{}
+
+foreach ($t in $allTurns) {
     $tsid = $null
     if ($t.sessionId) { $tsid = $t.sessionId }
     elseif ($t.session -and $t.session.id) { $tsid = $t.session.id }
 
-    # Intent + confidence + slots (guarded nested access)
-    $intentName = ""
-    $intentConfidence = ""
-    $slots = ""
+    $intentName = ""; $intentConfidence = ""; $slots = ""
     if ($t.intent) {
         $intentName = [string]$t.intent.name
         if ($null -ne $t.intent.confidence) { $intentConfidence = [string]$t.intent.confidence }
         if ($t.intent.slots) { $slots = ConvertTo-Json -InputObject $t.intent.slots -Depth 10 -Compress }
     }
 
-    # Ask action details
-    $askActionId = ""
-    $askActionName = ""
-    $askActionType = ""
+    $askActionId = ""; $askActionName = ""; $askActionType = ""
     if ($t.askAction) {
         $askActionId   = [string]$t.askAction.id
         $askActionName = [string]$t.askAction.name
         $askActionType = [string]$t.askAction.type
-    }
-
-    # User input can be a plain string or a nested object depending on schema
-    $userInput = ""
-    if ($null -ne $t.userInput) {
-        if ($t.userInput -is [string]) { $userInput = $t.userInput }
-        else { $userInput = ConvertTo-Json -InputObject $t.userInput -Depth 10 -Compress }
     }
 
     $botPrompts = ""
@@ -340,8 +309,7 @@ foreach ($t in $allTurns) {
         else { $botPrompts = ConvertTo-Json -InputObject $t.botPrompts -Depth 10 -Compress }
     }
 
-    $endType = ""
-    $endReason = ""
+    $endType = ""; $endReason = ""
     if ($t.sessionEndDetails) {
         foreach ($d in @($t.sessionEndDetails)) {
             if ($endType -ne "")   { $endType += " | " }
@@ -351,66 +319,321 @@ foreach ($t in $allTurns) {
         }
     }
 
-    $knowledge = ""
-    if ($t.knowledge) { $knowledge = ConvertTo-Json -InputObject $t.knowledge -Depth 10 -Compress }
-
-    # Enrich with parent session outcome if we have it
-    $sessBotResult = ""
-    $sessConvId = ""
-    $sessMediaType = ""
+    $sessBotResult = ""; $sessConvId = ""
     if ($tsid -and $sessionLookup.ContainsKey([string]$tsid)) {
         $parent = $sessionLookup[[string]$tsid]
         $sessBotResult = [string]$parent.BotResult
         $sessConvId    = [string]$parent.ConversationId
-        $sessMediaType = [string]$parent.MediaType
     }
 
     $row = New-Object PSObject -Property @{
-        SessionId              = $tsid
-        ConversationId         = $sessConvId
-        FlowId                 = $FlowId
-        TurnDateCreated        = [string]$t.dateCreated
-        UserInput              = $userInput
-        AskActionId            = $askActionId
-        AskActionName          = $askActionName
-        AskActionType          = $askActionType
-        AskActionResult        = [string]$t.askActionResult
-        IntentName             = $intentName
-        IntentConfidence       = $intentConfidence
-        Slots                  = $slots
-        BotPrompts             = $botPrompts
-        Knowledge              = $knowledge
-        SessionEndType         = $endType
-        SessionEndReason       = $endReason
-        SessionBotResult       = $sessBotResult
-        SessionMediaType       = $sessMediaType
-        RawJson                = (ConvertTo-Json -InputObject $t -Depth 15 -Compress)
+        SessionId        = $tsid
+        ConversationId   = $sessConvId
+        FlowId           = $FlowId
+        TurnDateCreated  = [string]$t.dateCreated
+        UserInput        = (Get-UserInputText -UserInput $t.userInput)
+        AskActionId      = $askActionId
+        AskActionName    = $askActionName
+        AskActionType    = $askActionType
+        AskActionResult  = [string]$t.askActionResult
+        IntentName       = $intentName
+        IntentConfidence = $intentConfidence
+        Slots            = $slots
+        BotPrompts       = $botPrompts
+        SessionEndType   = $endType
+        SessionEndReason = $endReason
+        SessionBotResult = $sessBotResult
+        RawJson          = (ConvertTo-Json -InputObject $t -Depth 15 -Compress)
     }
     $turnRows += $row
+
+    if ($tsid) {
+        $key = [string]$tsid
+        if (-not $turnsBySession.ContainsKey($key)) { $turnsBySession[$key] = @() }
+        $turnsBySession[$key] += $row
+    }
+}
+
+# ============================================================
+# STEP 7 - OPTIONAL: CONVERSATION DETAILS (ANI / DNIS / direction)
+# ============================================================
+$convLookup = @{}
+if ($IncludeConversationDetails) {
+    Write-Host ""
+    Write-Host "Enriching with conversation details (ANI/DNIS)..." -ForegroundColor Cyan
+
+    # Unique conversation IDs
+    $convIds = @()
+    foreach ($sr in $sessionRows) {
+        $cid = [string]$sr.ConversationId
+        if ($cid -and $cid -ne "" -and ($convIds -notcontains $cid)) { $convIds += $cid }
+    }
+    Write-Host ("  Unique conversations to look up: " + $convIds.Count)
+
+    # Pad interval start by 1 day - the conversation may have started before the survey session
+    $convInterval = (Get-Date -Date $startUtc.AddDays(-1) -Format "yyyy-MM-ddTHH:mm:ss") + ".000Z/" + `
+                    (Get-Date -Date $nowUtc -Format "yyyy-MM-ddTHH:mm:ss") + ".000Z"
+
+    # Query in chunks of 25 conversation IDs
+    $chunkSize = 25
+    $pos = 0
+    while ($pos -lt $convIds.Count) {
+        $predicates = @()
+        $j = $pos
+        while ($j -lt $convIds.Count -and $j -lt ($pos + $chunkSize)) {
+            $predicates += @{ dimension = "conversationId"; value = $convIds[$j] }
+            $j++
+        }
+        $pos = $j
+
+        $bodyHash = @{
+            interval = $convInterval
+            order    = "asc"
+            orderBy  = "conversationStart"
+            paging   = @{ pageSize = 100; pageNumber = 1 }
+            conversationFilters = @(
+                @{ type = "or"; predicates = $predicates }
+            )
+        }
+        $bodyJson = ConvertTo-Json -InputObject $bodyHash -Depth 10
+
+        $detailResp = $null
+        try {
+            $detailResp = Invoke-GenesysApi -Method "POST" -Uri ($ApiBase + "/api/v2/analytics/conversations/details/query") -Headers $apiHeaders -Body $bodyJson
+        }
+        catch {
+            Write-Host ("  Conversation details chunk failed - continuing without enrichment for this chunk. " + $_.Exception.Message) -ForegroundColor Yellow
+        }
+
+        if ($detailResp -and $detailResp.conversations) {
+            foreach ($conv in $detailResp.conversations) {
+                $ani = ""; $dnis = ""
+                if ($conv.participants) {
+                    foreach ($pt in $conv.participants) {
+                        if ($pt.purpose -eq "customer" -or $pt.purpose -eq "external") {
+                            if ($pt.sessions) {
+                                foreach ($ps in $pt.sessions) {
+                                    if ($ani -eq ""  -and $ps.ani)  { $ani  = [string]$ps.ani }
+                                    if ($dnis -eq "" -and $ps.dnis) { $dnis = [string]$ps.dnis }
+                                }
+                            }
+                        }
+                    }
+                }
+                $cRow = New-Object PSObject -Property @{
+                    Ani                  = $ani
+                    Dnis                 = $dnis
+                    OriginatingDirection = [string]$conv.originatingDirection
+                    ConversationStart    = [string]$conv.conversationStart
+                    ConversationEnd      = [string]$conv.conversationEnd
+                }
+                if ($conv.conversationId -and -not $convLookup.ContainsKey([string]$conv.conversationId)) {
+                    $convLookup[[string]$conv.conversationId] = $cRow
+                }
+            }
+        }
+        Write-Host ("  Looked up {0}/{1} conversations" -f $pos, $convIds.Count)
+    }
+}
+
+# ============================================================
+# STEP 8 - BUILD THE PIVOTED SURVEY RESULTS CSV (one row per session)
+# ============================================================
+Write-Host ""
+Write-Host "Building pivoted survey results (one row per session)..." -ForegroundColor Cyan
+
+$surveyRows = @()
+foreach ($sr in $sessionRows) {
+    $key = [string]$sr.SessionId
+
+    $row = New-Object PSObject -Property @{
+        SessionId         = $sr.SessionId
+        ConversationId    = $sr.ConversationId
+        Ani               = ""
+        Dnis              = ""
+        Direction         = ""
+        ConversationStart = ""
+        SurveyStartTime   = $sr.SessionStartTime
+        SurveyEndTime     = $sr.SessionEndTime
+        DurationSec       = $sr.SessionDurationSec
+        MediaType         = $sr.MediaType
+        BotResult         = $sr.BotResult
+        BotResultCategory = $sr.BotResultCategory
+        SessionEndType    = $sr.SessionEndType
+        SessionEndReason  = $sr.SessionEndReason
+        SelfServed        = $sr.SelfServed
+        TotalTurns        = 0
+        SurveyCompleted   = "No"
+        ExtraTurnsJson    = ""
+    }
+
+    if ($convLookup.ContainsKey([string]$sr.ConversationId)) {
+        $cd = $convLookup[[string]$sr.ConversationId]
+        $row.Ani               = $cd.Ani
+        $row.Dnis              = $cd.Dnis
+        $row.Direction         = $cd.OriginatingDirection
+        $row.ConversationStart = $cd.ConversationStart
+    }
+
+    # Group this session's turns into questions.
+    # Consecutive turns for the same Ask action = retries (attempts) of one question.
+    # Final attempt supplies the recorded answer / confidence / result.
+    $questions = @()   # each element: hashtable with Name, Prompt, Answer, Confidence, Intent, Result, Attempts, Timestamp
+    $extraTurns = @()
+
+    if ($turnsBySession.ContainsKey($key)) {
+        $ordered = $turnsBySession[$key] | Sort-Object TurnDateCreated
+        $row.TotalTurns = @($ordered).Count
+
+        foreach ($t in $ordered) {
+            $qName = [string]$t.AskActionName
+            if ($qName -eq "") {
+                # Turn with no ask action (e.g. exit/disconnect turn) - keep in overflow
+                $extraTurns += $t
+                continue
+            }
+            $matched = $false
+            if ($questions.Count -gt 0) {
+                $last = $questions[$questions.Count - 1]
+                if ($last.Name -eq $qName) {
+                    # Retry of the same question - overwrite with latest attempt
+                    $last.Attempts   = $last.Attempts + 1
+                    $last.Answer     = $t.UserInput
+                    $last.Confidence = $t.IntentConfidence
+                    $last.Intent     = $t.IntentName
+                    $last.Result     = $t.AskActionResult
+                    $last.Timestamp  = $t.TurnDateCreated
+                    if ($t.BotPrompts -ne "") { $last.Prompt = $t.BotPrompts }
+                    $matched = $true
+                }
+            }
+            if (-not $matched) {
+                $questions += @{
+                    Name       = $qName
+                    Prompt     = $t.BotPrompts
+                    Answer     = $t.UserInput
+                    Confidence = $t.IntentConfidence
+                    Intent     = $t.IntentName
+                    Result     = $t.AskActionResult
+                    Attempts   = 1
+                    Timestamp  = $t.TurnDateCreated
+                }
+            }
+        }
+    }
+
+    # Completed = every expected question got a non-empty answer
+    if ($questions.Count -ge $MaxQuestions) {
+        $answeredAll = $true
+        $qi = 0
+        while ($qi -lt $MaxQuestions) {
+            if ([string]$questions[$qi].Answer -eq "") { $answeredAll = $false }
+            $qi++
+        }
+        if ($answeredAll) { $row.SurveyCompleted = "Yes" }
+    }
+
+    # Add Q1..Qn columns via Add-Member (cmdlet - CLM safe)
+    $qi = 0
+    while ($qi -lt $MaxQuestions) {
+        $n = $qi + 1
+        $q = $null
+        if ($qi -lt $questions.Count) { $q = $questions[$qi] }
+
+        $qName = "";  $qPrompt = ""; $qAnswer = ""; $qConf = ""; $qIntent = ""; $qResult = ""; $qAtt = ""; $qTime = ""
+        if ($q) {
+            $qName   = [string]$q.Name
+            $qPrompt = [string]$q.Prompt
+            $qAnswer = [string]$q.Answer
+            $qConf   = [string]$q.Confidence
+            $qIntent = [string]$q.Intent
+            $qResult = [string]$q.Result
+            $qAtt    = [string]$q.Attempts
+            $qTime   = [string]$q.Timestamp
+        }
+        Add-Member -InputObject $row -NotePropertyName ("Q" + $n + "_Question")   -NotePropertyValue $qName
+        Add-Member -InputObject $row -NotePropertyName ("Q" + $n + "_Prompt")     -NotePropertyValue $qPrompt
+        Add-Member -InputObject $row -NotePropertyName ("Q" + $n + "_Answer")     -NotePropertyValue $qAnswer
+        Add-Member -InputObject $row -NotePropertyName ("Q" + $n + "_Confidence") -NotePropertyValue $qConf
+        Add-Member -InputObject $row -NotePropertyName ("Q" + $n + "_Intent")     -NotePropertyValue $qIntent
+        Add-Member -InputObject $row -NotePropertyName ("Q" + $n + "_Result")     -NotePropertyValue $qResult
+        Add-Member -InputObject $row -NotePropertyName ("Q" + $n + "_Attempts")   -NotePropertyValue $qAtt
+        Add-Member -InputObject $row -NotePropertyName ("Q" + $n + "_Timestamp")  -NotePropertyValue $qTime
+        $qi++
+    }
+
+    # Anything beyond the expected question count, plus non-ask turns
+    $overflow = @()
+    $qi = $MaxQuestions
+    while ($qi -lt $questions.Count) { $overflow += $questions[$qi]; $qi++ }
+    foreach ($et in $extraTurns) {
+        $overflow += @{ Name = "(no ask action)"; Answer = $et.UserInput; Result = $et.AskActionResult; EndReason = $et.SessionEndReason; Timestamp = $et.TurnDateCreated }
+    }
+    if ($overflow.Count -gt 0) {
+        $row.ExtraTurnsJson = ConvertTo-Json -InputObject $overflow -Depth 10 -Compress
+    }
+
+    $surveyRows += $row
+}
+
+# Build explicit column order (array of strings works with Select-Object in CLM)
+$surveyCols = @("SessionId", "ConversationId", "Ani", "Dnis", "Direction", "ConversationStart", `
+    "SurveyStartTime", "SurveyEndTime", "DurationSec", "MediaType", "BotResult", "BotResultCategory", `
+    "SurveyCompleted", "TotalTurns")
+$qi = 1
+while ($qi -le $MaxQuestions) {
+    $surveyCols += ("Q" + $qi + "_Question")
+    $surveyCols += ("Q" + $qi + "_Prompt")
+    $surveyCols += ("Q" + $qi + "_Answer")
+    $surveyCols += ("Q" + $qi + "_Confidence")
+    $surveyCols += ("Q" + $qi + "_Intent")
+    $surveyCols += ("Q" + $qi + "_Result")
+    $surveyCols += ("Q" + $qi + "_Attempts")
+    $surveyCols += ("Q" + $qi + "_Timestamp")
+    $qi++
+}
+$surveyCols += @("SessionEndType", "SessionEndReason", "SelfServed", "ExtraTurnsJson")
+
+# ============================================================
+# STEP 9 - EXPORT ALL THREE CSVs
+# ============================================================
+if ($surveyRows.Count -gt 0) {
+    $surveyRows | Sort-Object SurveyStartTime | Select-Object $surveyCols |
+        Export-Csv -Path $surveyCsv -NoTypeInformation -Encoding UTF8
+    Write-Host ("Survey results CSV : " + $surveyCsv) -ForegroundColor Green
+} else {
+    Write-Host "No sessions found - survey results CSV not written." -ForegroundColor Yellow
+}
+
+if ($sessionRows.Count -gt 0) {
+    $sessionRows |
+        Select-Object SessionId, ConversationId, FlowId, MediaType, BotResult, BotResultCategory, `
+            EndLanguage, SessionEndType, SessionEndReason, AskActionResults, SelfServed, `
+            SessionStartTime, SessionEndTime, SessionDurationSec, RawJson |
+        Export-Csv -Path $sessionsCsv -NoTypeInformation -Encoding UTF8
+    Write-Host ("Sessions CSV       : " + $sessionsCsv) -ForegroundColor Green
 }
 
 if ($turnRows.Count -gt 0) {
-    $turnRows |
-        Sort-Object SessionId, TurnDateCreated |
-        Select-Object SessionId, ConversationId, FlowId, TurnDateCreated, UserInput, `
-            AskActionId, AskActionName, AskActionType, AskActionResult, IntentName, `
-            IntentConfidence, Slots, BotPrompts, Knowledge, SessionEndType, SessionEndReason, `
-            SessionBotResult, SessionMediaType, RawJson |
+    $turnRows | Sort-Object SessionId, TurnDateCreated |
+        Select-Object SessionId, ConversationId, FlowId, TurnDateCreated, UserInput, AskActionId, `
+            AskActionName, AskActionType, AskActionResult, IntentName, IntentConfidence, Slots, `
+            BotPrompts, SessionEndType, SessionEndReason, SessionBotResult, RawJson |
         Export-Csv -Path $utterancesCsv -NoTypeInformation -Encoding UTF8
-    Write-Host ("Utterances CSV written: " + $utterancesCsv) -ForegroundColor Green
-} else {
-    Write-Host "No reporting turns found in the interval - utterances CSV not written." -ForegroundColor Yellow
+    Write-Host ("Utterances CSV     : " + $utterancesCsv) -ForegroundColor Green
 }
 
 # ============================================================
 # SUMMARY
 # ============================================================
+$completed = 0
+foreach ($r in $surveyRows) { if ($r.SurveyCompleted -eq "Yes") { $completed++ } }
+
 Write-Host ""
 Write-Host "==================== SUMMARY ====================" -ForegroundColor Cyan
-Write-Host ("Flow ID          : " + $FlowId)
-Write-Host ("Interval         : " + $interval)
-Write-Host ("Sessions         : " + $allSessions.Count)
-Write-Host ("Utterance turns  : " + $allTurns.Count)
-Write-Host ("Sessions CSV     : " + $sessionsCsv)
-Write-Host ("Utterances CSV   : " + $utterancesCsv)
+Write-Host ("Flow ID            : " + $FlowId)
+Write-Host ("Interval           : " + $interval)
+Write-Host ("Survey sessions    : " + $allSessions.Count)
+Write-Host ("Completed surveys  : " + $completed)
+Write-Host ("Utterance turns    : " + $allTurns.Count)
 Write-Host "=================================================" -ForegroundColor Cyan
