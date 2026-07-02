@@ -1,0 +1,409 @@
+<#
+.SYNOPSIS
+    Extracts full flow execution history from Genesys Cloud (AU region) to CSV.
+
+.DESCRIPTION
+    Uses the Analytics Conversation Details query (POST /api/v2/analytics/conversations/details/query)
+    filtered to participants with purpose = flow. Every flow session found is flattened
+    into one CSV row with all available flow execution fields: flow identity, entry/exit
+    reasons, transfer details, languages, recognition failures, outcomes, segments,
+    session metrics and timing.
+
+    This covers all flow executions attached to conversations (inbound/outbound call,
+    message, email, in-queue, voicemail, bot flows etc.). Standalone workflow executions
+    not tied to a conversation are not surfaced by this API.
+
+    Required OAuth scope/permission: analytics:conversationDetail:view
+
+.NOTES
+    CLM-safe: no .NET static methods, no ::new(), no [pscustomobject], pure-PowerShell Base64.
+    Target: Windows PowerShell 5.1, Constrained Language Mode.
+    Region: mypurecloud.com.au
+#>
+
+# =========================================================================
+# CONFIGURATION - EDIT THESE
+# =========================================================================
+$ClientId     = "YOUR_CLIENT_ID_HERE"
+$ClientSecret = "YOUR_CLIENT_SECRET_HERE"
+$Region       = "mypurecloud.com.au"
+
+# How many days back to query (sync details query supports up to 31 days per request)
+$DaysBack = 7
+
+# Output CSV path (timestamped)
+$OutputPath = Join-Path (Get-Location) ("GenesysFlowExecutionHistory_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".csv")
+
+# =========================================================================
+# PURE POWERSHELL BASE64 (CLM-safe, no [Convert]:: / [Text.Encoding]::)
+# =========================================================================
+function ConvertTo-Base64String {
+    param([string]$InputString)
+
+    $b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    $bytes = @()
+    foreach ($c in $InputString.ToCharArray()) {
+        $bytes += [int][char]$c
+    }
+
+    $out = ""
+    $i = 0
+    while ($i -lt $bytes.Count) {
+        $b1 = $bytes[$i]
+        $b2 = -1
+        $b3 = -1
+        if (($i + 1) -lt $bytes.Count) { $b2 = $bytes[$i + 1] }
+        if (($i + 2) -lt $bytes.Count) { $b3 = $bytes[$i + 2] }
+
+        $out += [string]$b64chars[($b1 -shr 2) -band 63]
+
+        if ($b2 -ge 0) {
+            $out += [string]$b64chars[(($b1 -shl 4) -bor ($b2 -shr 4)) -band 63]
+            if ($b3 -ge 0) {
+                $out += [string]$b64chars[(($b2 -shl 2) -bor ($b3 -shr 6)) -band 63]
+                $out += [string]$b64chars[$b3 -band 63]
+            } else {
+                $out += [string]$b64chars[($b2 -shl 2) -band 63]
+                $out += "="
+            }
+        } else {
+            $out += [string]$b64chars[($b1 -shl 4) -band 63]
+            $out += "=="
+        }
+        $i += 3
+    }
+    return $out
+}
+
+# =========================================================================
+# API CALL WRAPPER - handles 429 rate limiting and reports HTTP errors
+# =========================================================================
+function Invoke-GenesysApi {
+    param(
+        [string]$Uri,
+        [string]$Method,
+        [hashtable]$Headers,
+        [string]$Body
+    )
+
+    $maxRetries = 5
+    $attempt = 0
+
+    while ($attempt -lt $maxRetries) {
+        $attempt += 1
+        try {
+            if ($Body) {
+                $result = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -Body $Body -ContentType "application/json" -ErrorAction Stop
+            } else {
+                $result = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -ErrorAction Stop
+            }
+            return $result
+        }
+        catch {
+            $statusCode = 0
+            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = 0 }
+
+            if ($statusCode -eq 429 -or ($_.Exception.Message -like "*429*")) {
+                Write-Host ("  Rate limited (429). Waiting 35 seconds before retry " + $attempt + " of " + $maxRetries + "...") -ForegroundColor Yellow
+                Start-Sleep -Seconds 35
+                continue
+            }
+            elseif ($statusCode -eq 401 -or ($_.Exception.Message -like "*401*")) {
+                Write-Host "  ERROR 401: Unauthorized. Check client id/secret and OAuth scopes (analytics:conversationDetail:view)." -ForegroundColor Red
+                throw
+            }
+            elseif ($statusCode -eq 403 -or ($_.Exception.Message -like "*403*")) {
+                Write-Host "  ERROR 403: Forbidden. The OAuth client role is missing the required permission." -ForegroundColor Red
+                throw
+            }
+            else {
+                Write-Host ("  API error (HTTP " + $statusCode + "): " + $_.Exception.Message) -ForegroundColor Red
+                throw
+            }
+        }
+    }
+    throw "Exceeded maximum retries calling $Uri"
+}
+
+# =========================================================================
+# STEP 1: AUTHENTICATE (client credentials grant)
+# =========================================================================
+Write-Host "Authenticating to Genesys Cloud ($Region)..." -ForegroundColor Cyan
+
+$basicAuth = "Basic " + (ConvertTo-Base64String ($ClientId + ":" + $ClientSecret))
+$tokenUri  = "https://login." + $Region + "/oauth/token"
+
+$token = $null
+try {
+    $token = Invoke-RestMethod -Uri $tokenUri -Method Post `
+        -Headers @{ Authorization = $basicAuth } `
+        -Body @{ grant_type = "client_credentials" } `
+        -ContentType "application/x-www-form-urlencoded" -ErrorAction Stop
+}
+catch {
+    $statusCode = 0
+    try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = 0 }
+    Write-Host ("Authentication failed (HTTP " + $statusCode + "): " + $_.Exception.Message) -ForegroundColor Red
+    return
+}
+
+if (-not $token -or -not $token.access_token) {
+    Write-Host "Authentication response did not contain an access_token. Aborting." -ForegroundColor Red
+    return
+}
+
+Write-Host "Authenticated OK. Token expires in $($token.expires_in) seconds." -ForegroundColor Green
+
+$apiHeaders = @{ Authorization = "Bearer " + $token.access_token }
+$apiBase    = "https://api." + $Region
+
+# =========================================================================
+# STEP 2: BUILD QUERY INTERVAL (UTC)
+# =========================================================================
+$endUtc   = (Get-Date).ToUniversalTime()
+$startUtc = $endUtc.AddDays(-1 * $DaysBack)
+$interval = $startUtc.ToString("yyyy-MM-ddTHH:mm:ss") + ".000Z/" + $endUtc.ToString("yyyy-MM-ddTHH:mm:ss") + ".000Z"
+
+Write-Host ("Query interval (UTC): " + $interval) -ForegroundColor Cyan
+
+# =========================================================================
+# STEP 3: PAGE THROUGH CONVERSATION DETAILS (flow participants only)
+# =========================================================================
+$detailsUri = $apiBase + "/api/v2/analytics/conversations/details/query"
+$allRows    = @()
+$pageNumber = 1
+$pageSize   = 100
+$totalConversations = 0
+$keepGoing  = $true
+
+while ($keepGoing) {
+
+    $queryBody = @{
+        interval = $interval
+        order    = "asc"
+        orderBy  = "conversationStart"
+        paging   = @{
+            pageSize   = $pageSize
+            pageNumber = $pageNumber
+        }
+        segmentFilters = @(
+            @{
+                type = "or"
+                predicates = @(
+                    @{
+                        type      = "dimension"
+                        dimension = "purpose"
+                        operator  = "matches"
+                        value     = "flow"
+                    }
+                )
+            }
+        )
+    }
+
+    $jsonBody = ConvertTo-Json -InputObject $queryBody -Depth 10
+
+    Write-Host ("Fetching page " + $pageNumber + "...") -ForegroundColor Cyan
+    $response = Invoke-GenesysApi -Uri $detailsUri -Method "Post" -Headers $apiHeaders -Body $jsonBody
+
+    if (-not $response -or -not $response.conversations -or $response.conversations.Count -eq 0) {
+        Write-Host "No more conversations returned. Paging complete." -ForegroundColor Green
+        $keepGoing = $false
+        break
+    }
+
+    $pageCount = $response.conversations.Count
+    $totalConversations += $pageCount
+    Write-Host ("  Page " + $pageNumber + ": " + $pageCount + " conversations (running total " + $totalConversations + ")")
+
+    foreach ($conv in $response.conversations) {
+
+        $divisionIds = ""
+        if ($conv.divisionIds) { $divisionIds = ($conv.divisionIds -join ";") }
+
+        foreach ($participant in $conv.participants) {
+
+            if ($participant.purpose -ne "flow") { continue }
+            if (-not $participant.sessions) { continue }
+
+            foreach ($session in $participant.sessions) {
+
+                # ---- Flow object (may be absent on some sessions) ----
+                $flow = $session.flow
+
+                $flowId        = ""
+                $flowName      = ""
+                $flowVersion   = ""
+                $flowType      = ""
+                $entryReason   = ""
+                $entryType     = ""
+                $exitReason    = ""
+                $transferType  = ""
+                $transferAddr  = ""
+                $transferName  = ""
+                $issuedCb      = ""
+                $startLang     = ""
+                $endLang       = ""
+                $recogFail     = ""
+
+                if ($flow) {
+                    if ($flow.flowId)                   { $flowId       = [string]$flow.flowId }
+                    if ($flow.flowName)                 { $flowName     = [string]$flow.flowName }
+                    if ($flow.flowVersion)              { $flowVersion  = [string]$flow.flowVersion }
+                    if ($flow.flowType)                 { $flowType     = [string]$flow.flowType }
+                    if ($flow.entryReason)              { $entryReason  = [string]$flow.entryReason }
+                    if ($flow.entryType)                { $entryType    = [string]$flow.entryType }
+                    if ($flow.exitReason)               { $exitReason   = [string]$flow.exitReason }
+                    if ($flow.transferType)             { $transferType = [string]$flow.transferType }
+                    if ($flow.transferTargetAddress)    { $transferAddr = [string]$flow.transferTargetAddress }
+                    if ($flow.transferTargetName)       { $transferName = [string]$flow.transferTargetName }
+                    if ($null -ne $flow.issuedCallback) { $issuedCb     = [string]$flow.issuedCallback }
+                    if ($flow.startingLanguage)         { $startLang    = [string]$flow.startingLanguage }
+                    if ($flow.endingLanguage)           { $endLang      = [string]$flow.endingLanguage }
+                    if ($flow.recognitionFailureReason) { $recogFail    = [string]$flow.recognitionFailureReason }
+                }
+
+                # ---- Flow outcomes ----
+                $outcomeText = ""
+                if ($flow -and $flow.outcomes) {
+                    $outcomeParts = @()
+                    foreach ($oc in $flow.outcomes) {
+                        $ocName  = ""
+                        $ocValue = ""
+                        $ocStart = ""
+                        $ocEnd   = ""
+                        if ($oc.flowOutcomeId)             { $ocName  = [string]$oc.flowOutcomeId }
+                        if ($oc.flowOutcome)               { $ocName  = [string]$oc.flowOutcome }
+                        if ($oc.flowOutcomeValue)          { $ocValue = [string]$oc.flowOutcomeValue }
+                        if ($oc.flowOutcomeStartTimestamp) { $ocStart = [string]$oc.flowOutcomeStartTimestamp }
+                        if ($oc.flowOutcomeEndTimestamp)   { $ocEnd   = [string]$oc.flowOutcomeEndTimestamp }
+                        $outcomeParts += ($ocName + "=" + $ocValue + " (" + $ocStart + " -> " + $ocEnd + ")")
+                    }
+                    $outcomeText = ($outcomeParts -join " | ")
+                }
+
+                # ---- Segments: timing, types, disconnects ----
+                $segTypes        = @()
+                $segDisconnects  = @()
+                $flowStartTime   = ""
+                $flowEndTime     = ""
+                $flowDurationSec = ""
+
+                if ($session.segments -and $session.segments.Count -gt 0) {
+                    foreach ($seg in $session.segments) {
+                        if ($seg.segmentType)    { $segTypes       += [string]$seg.segmentType }
+                        if ($seg.disconnectType) { $segDisconnects += [string]$seg.disconnectType }
+                    }
+
+                    $firstSeg = $session.segments[0]
+                    $lastSeg  = $session.segments[$session.segments.Count - 1]
+
+                    if ($firstSeg.segmentStart) { $flowStartTime = [string]$firstSeg.segmentStart }
+                    if ($lastSeg.segmentEnd)    { $flowEndTime   = [string]$lastSeg.segmentEnd }
+
+                    if ($flowStartTime -ne "" -and $flowEndTime -ne "") {
+                        try {
+                            $dtStart = [datetime]$flowStartTime
+                            $dtEnd   = [datetime]$flowEndTime
+                            $span    = $dtEnd - $dtStart
+                            $flowDurationSec = [string]([int]$span.TotalSeconds)
+                        }
+                        catch {
+                            $flowDurationSec = ""
+                        }
+                    }
+                }
+
+                # ---- Session-level metrics (name=value pairs) ----
+                $metricText = ""
+                if ($session.metrics) {
+                    $metricParts = @()
+                    foreach ($m in $session.metrics) {
+                        $mName  = ""
+                        $mValue = ""
+                        if ($m.name)            { $mName  = [string]$m.name }
+                        if ($null -ne $m.value) { $mValue = [string]$m.value }
+                        $metricParts += ($mName + "=" + $mValue)
+                    }
+                    $metricText = ($metricParts -join "; ")
+                }
+
+                # ---- Build the row ----
+                $row = New-Object PSObject -Property @{
+                    ConversationId           = [string]$conv.conversationId
+                    ConversationStart        = [string]$conv.conversationStart
+                    ConversationEnd          = [string]$conv.conversationEnd
+                    OriginatingDirection     = [string]$conv.originatingDirection
+                    DivisionIds              = $divisionIds
+                    ParticipantId            = [string]$participant.participantId
+                    ParticipantName          = [string]$participant.participantName
+                    SessionId                = [string]$session.sessionId
+                    MediaType                = [string]$session.mediaType
+                    Direction                = [string]$session.direction
+                    Ani                      = [string]$session.ani
+                    Dnis                     = [string]$session.dnis
+                    SessionDnis              = [string]$session.sessionDnis
+                    Provider                 = [string]$session.provider
+                    PeerId                   = [string]$session.peerId
+                    FlowId                   = $flowId
+                    FlowName                 = $flowName
+                    FlowVersion              = $flowVersion
+                    FlowType                 = $flowType
+                    EntryReason              = $entryReason
+                    EntryType                = $entryType
+                    ExitReason               = $exitReason
+                    TransferType             = $transferType
+                    TransferTargetAddress    = $transferAddr
+                    TransferTargetName       = $transferName
+                    IssuedCallback           = $issuedCb
+                    StartingLanguage         = $startLang
+                    EndingLanguage           = $endLang
+                    RecognitionFailureReason = $recogFail
+                    FlowStartTime            = $flowStartTime
+                    FlowEndTime              = $flowEndTime
+                    FlowDurationSeconds      = $flowDurationSec
+                    SegmentTypes             = ($segTypes -join ";")
+                    DisconnectTypes          = ($segDisconnects -join ";")
+                    FlowOutcomes             = $outcomeText
+                    SessionMetrics           = $metricText
+                }
+                $allRows += $row
+            }
+        }
+    }
+
+    if ($pageCount -lt $pageSize) {
+        Write-Host "Final page reached." -ForegroundColor Green
+        $keepGoing = $false
+    } else {
+        $pageNumber += 1
+    }
+}
+
+# =========================================================================
+# STEP 4: EXPORT TO CSV (explicit column order - CLM Property hashtables
+#         do not preserve order, so Select-Object controls it)
+# =========================================================================
+Write-Host ""
+Write-Host ("Conversations processed : " + $totalConversations) -ForegroundColor Cyan
+Write-Host ("Flow execution rows     : " + $allRows.Count) -ForegroundColor Cyan
+
+if ($allRows.Count -eq 0) {
+    Write-Host "No flow executions found in the interval. Nothing to export." -ForegroundColor Yellow
+    return
+}
+
+$allRows |
+    Select-Object ConversationId, ConversationStart, ConversationEnd, OriginatingDirection, DivisionIds, `
+                  ParticipantId, ParticipantName, SessionId, MediaType, Direction, `
+                  Ani, Dnis, SessionDnis, Provider, PeerId, `
+                  FlowId, FlowName, FlowVersion, FlowType, `
+                  EntryReason, EntryType, ExitReason, `
+                  TransferType, TransferTargetAddress, TransferTargetName, IssuedCallback, `
+                  StartingLanguage, EndingLanguage, RecognitionFailureReason, `
+                  FlowStartTime, FlowEndTime, FlowDurationSeconds, `
+                  SegmentTypes, DisconnectTypes, FlowOutcomes, SessionMetrics |
+    Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host ("Export complete: " + $OutputPath) -ForegroundColor Green
