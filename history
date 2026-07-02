@@ -31,6 +31,9 @@ $Region       = "mypurecloud.com.au"
 # How many days back to query (sync details query supports up to 31 days per request)
 $DaysBack = 7
 
+# Only export executions of this flow ID. Leave as "" to export ALL flows.
+$TargetFlowId = "PASTE_YOUR_FLOW_ID_HERE"
+
 # Output CSV path (timestamped)
 $OutputPath = Join-Path (Get-Location) ("GenesysFlowExecutionHistory_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".csv")
 
@@ -186,17 +189,6 @@ while ($keepGoing) {
             pageSize   = $pageSize
             pageNumber = $pageNumber
         }
-        segmentFilters = @(
-            @{
-                type = "or"
-                predicates = @(
-                    @{ type = "dimension"; dimension = "purpose"; operator = "matches"; value = "ivr" },
-                    @{ type = "dimension"; dimension = "purpose"; operator = "matches"; value = "botflow" },
-                    @{ type = "dimension"; dimension = "purpose"; operator = "matches"; value = "workflow" },
-                    @{ type = "dimension"; dimension = "purpose"; operator = "matches"; value = "voicesurvey" }
-                )
-            }
-        )
     }
 
     $jsonBody = ConvertTo-Json -InputObject $queryBody -Depth 10
@@ -227,6 +219,11 @@ while ($keepGoing) {
 
                 # Only keep sessions that actually carry flow execution data
                 if (-not $session.flow) { continue }
+
+                # Client-side filter to the target flow, if one is configured
+                if ($TargetFlowId -ne "" -and $TargetFlowId -ne "PASTE_YOUR_FLOW_ID_HERE") {
+                    if ([string]$session.flow.flowId -ne $TargetFlowId) { continue }
+                }
 
                 # ---- Flow object (may be absent on some sessions) ----
                 $flow = $session.flow
