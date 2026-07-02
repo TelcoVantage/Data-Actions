@@ -190,12 +190,10 @@ while ($keepGoing) {
             @{
                 type = "or"
                 predicates = @(
-                    @{
-                        type      = "dimension"
-                        dimension = "purpose"
-                        operator  = "matches"
-                        value     = "flow"
-                    }
+                    @{ type = "dimension"; dimension = "purpose"; operator = "matches"; value = "ivr" },
+                    @{ type = "dimension"; dimension = "purpose"; operator = "matches"; value = "botflow" },
+                    @{ type = "dimension"; dimension = "purpose"; operator = "matches"; value = "workflow" },
+                    @{ type = "dimension"; dimension = "purpose"; operator = "matches"; value = "voicesurvey" }
                 )
             }
         )
@@ -223,10 +221,12 @@ while ($keepGoing) {
 
         foreach ($participant in $conv.participants) {
 
-            if ($participant.purpose -ne "flow") { continue }
             if (-not $participant.sessions) { continue }
 
             foreach ($session in $participant.sessions) {
+
+                # Only keep sessions that actually carry flow execution data
+                if (-not $session.flow) { continue }
 
                 # ---- Flow object (may be absent on some sessions) ----
                 $flow = $session.flow
@@ -337,6 +337,7 @@ while ($keepGoing) {
                     DivisionIds              = $divisionIds
                     ParticipantId            = [string]$participant.participantId
                     ParticipantName          = [string]$participant.participantName
+                    ParticipantPurpose       = [string]$participant.purpose
                     SessionId                = [string]$session.sessionId
                     MediaType                = [string]$session.mediaType
                     Direction                = [string]$session.direction
@@ -395,7 +396,7 @@ if ($allRows.Count -eq 0) {
 
 $allRows |
     Select-Object ConversationId, ConversationStart, ConversationEnd, OriginatingDirection, DivisionIds, `
-                  ParticipantId, ParticipantName, SessionId, MediaType, Direction, `
+                  ParticipantId, ParticipantName, ParticipantPurpose, SessionId, MediaType, Direction, `
                   Ani, Dnis, SessionDnis, Provider, PeerId, `
                   FlowId, FlowName, FlowVersion, FlowType, `
                   EntryReason, EntryType, ExitReason, `
